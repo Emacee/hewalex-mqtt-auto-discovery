@@ -11,10 +11,12 @@ Supports two communication modes:
   - eavesdrop: Passively listens to traffic between G-426 controller and PCWU
                (read-only, no write capability)
 
-Based on protocol research from:
-  - https://github.com/aelias-eu/hewalex-geco-protocol
-  - https://github.com/mvdklip/Domoticz-Hewalex
-  - https://github.com/Chibald/Hewalex2Mqtt
+v1.0.1 fixes:
+  - Register start address is now 16-bit LE (fixes config reads at base=300)
+  - Response data extracted from payload[10:] not payload[9:] (fixes misaligned temps)
+  - Writes use read-modify-write: full register block sent back with sub_fnc=0xA0
+  - Persistent socket connection (not reopened per request)
+  - Packet-length-aware serial reads prevent partial/misaligned packets
 """
 
 import os
@@ -22,14 +24,15 @@ import sys
 import time
 import logging
 import signal
+import socket
 import serial
 
 from geco_protocol import (
     build_read_request, build_write_request, parse_packet,
-    find_packets, extract_registers, signed16,
+    find_packets, extract_registers, registers_to_bytes,
     FNC_READ_STATUS_REQ, FNC_READ_STATUS_RESP,
     FNC_READ_CONFIG_REQ, FNC_READ_CONFIG_RESP,
-    HEADER_LEN,
+    HEADER_LEN, START_BYTE,
 )
 from pcwu_registers import (
     STATUS_REG_BASE, STATUS_REG_COUNT,
@@ -45,7 +48,7 @@ from mqtt_ha import HewalexMQTT
 
 DEVICE_ADDRESS = os.environ.get('DEVICE_ADDRESS', '192.168.1.100')
 DEVICE_PORT = int(os.environ.get('DEVICE_PORT', '8899'))
-MODE = os.environ.get('MODE', 'direct')  # 'direct' or 'eavesdrop'
+MODE = os.environ.get('MODE', 'direct')
 POLL_INTERVAL = int(os.environ.get('POLL_INTERVAL', '30'))
 LOG_LEVEL = os.environ.get('LOG_LEVEL', 'info').upper()
 
@@ -77,7 +80,8 @@ logger = logging.getLogger('hewalex')
 # ──────────────────────────────────────────────────────────────────────
 
 running = True
-write_queue = []  # list of (register_name, value) tuples pending write
+write_queue = []              # list of (register_name, value) pending write
+cached_config_regs = None     # list[int] — last-read raw config register values
 
 
 def signal_handler(sig, frame):
@@ -91,158 +95,314 @@ signal.signal(signal.SIGINT, signal_handler)
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Serial / TCP connection
+# Serial / TCP connection management
 # ──────────────────────────────────────────────────────────────────────
 
-def open_connection() -> serial.Serial:
-    """Open a TCP socket connection to the RS485-to-WiFi adapter via pyserial."""
-    url = f'socket://{DEVICE_ADDRESS}:{DEVICE_PORT}'
-    logger.info("Opening connection to %s", url)
-    ser = serial.serial_for_url(url, baudrate=38400, timeout=5)
-    return ser
-
-
-def send_and_receive(ser: serial.Serial, request: bytes,
-                     expected_fnc: int, timeout: float = 5.0) -> dict | None:
+class SerialConnection:
     """
-    Send a request and wait for the matching response.
+    Manages a persistent serial-over-TCP connection.
 
-    Flushes any stale data, sends the request, then reads until we get
-    a valid response with the expected function code or timeout.
+    Key design decisions:
+    - Connection is opened once and reused across poll cycles
+    - read_packet() accumulates bytes until a complete valid packet is found
+    - Input buffer is flushed before each new request to discard stale data
+    - Connection is automatically reopened on error
     """
-    # Flush input buffer
-    ser.reset_input_buffer()
 
-    logger.debug("TX (%d bytes): %s", len(request), request.hex())
-    ser.write(request)
+    def __init__(self, address: str, port: int):
+        self.url = f'socket://{address}:{port}'
+        self.ser = None
 
-    # Read response
-    start_time = time.time()
-    buffer = b''
+    def connect(self):
+        """Open or reopen the TCP socket connection."""
+        self.close()
+        logger.info("Opening connection to %s", self.url)
+        self.ser = serial.serial_for_url(self.url, baudrate=38400, timeout=3)
+        # Short initial timeout — we'll manage timing in read_packet
+        self.ser.timeout = 3
+        logger.info("Connection established")
 
-    while time.time() - start_time < timeout:
-        chunk = ser.read(256)
-        if chunk:
-            buffer += chunk
-            logger.debug("RX chunk (%d bytes), total buffer: %d",
-                          len(chunk), len(buffer))
+    def close(self):
+        if self.ser and self.ser.is_open:
+            try:
+                self.ser.close()
+            except Exception:
+                pass
+            self.ser = None
 
-            # Try to parse packets from buffer
+    @property
+    def is_open(self) -> bool:
+        return self.ser is not None and self.ser.is_open
+
+    def flush_input(self):
+        """Discard any stale bytes in the receive buffer."""
+        if self.ser:
+            self.ser.reset_input_buffer()
+            # Also drain anything the OS has buffered
+            old_timeout = self.ser.timeout
+            self.ser.timeout = 0.1
+            try:
+                while self.ser.read(512):
+                    pass
+            except Exception:
+                pass
+            self.ser.timeout = old_timeout
+
+    def send(self, data: bytes):
+        """Send raw bytes."""
+        if not self.is_open:
+            raise serial.SerialException("Not connected")
+        logger.debug("TX (%d bytes): %s", len(data), data.hex())
+        self.ser.write(data)
+        self.ser.flush()
+
+    def read_packet(self, expected_fnc: int, timeout: float = 5.0) -> dict | None:
+        """
+        Read bytes until we find a valid GECO packet with the expected FNC.
+
+        Uses a two-phase approach:
+        1. Read until we see a 0x69 start byte and have at least 8 header bytes
+        2. Parse the payload_len from the header, then read until we have the
+           full packet (header + payload_len bytes)
+        3. Validate both CRCs before accepting
+
+        This prevents the misaligned-read bug that caused garbage temperatures.
+        """
+        buffer = b''
+        start_time = time.time()
+
+        while time.time() - start_time < timeout:
+            # Try to read a chunk
+            remaining_time = timeout - (time.time() - start_time)
+            if remaining_time <= 0:
+                break
+
+            self.ser.timeout = min(remaining_time, 1.0)
+            try:
+                chunk = self.ser.read(256)
+            except serial.SerialException as e:
+                logger.error("Serial read error: %s", e)
+                raise
+
+            if chunk:
+                buffer += chunk
+                logger.debug("RX +%d bytes, buffer=%d", len(chunk), len(buffer))
+            elif not buffer:
+                # Nothing received at all yet, keep waiting
+                continue
+
+            # Try to find valid packets in accumulated buffer
             packets = find_packets(buffer)
             for parsed, end_pos in packets:
                 if parsed['fnc'] == expected_fnc:
-                    logger.debug("Got expected response FNC=0x%02X", expected_fnc)
+                    logger.debug("Got response FNC=0x%02X (%d bytes)",
+                                  expected_fnc, parsed['total_len'])
                     return parsed
+                else:
+                    logger.debug("Skipping packet FNC=0x%02X (want 0x%02X)",
+                                  parsed['fnc'], expected_fnc)
 
-            # If buffer is getting large without valid packets, trim
-            if len(buffer) > 1024:
+            # Trim processed data from buffer but keep potential partial packet
+            if packets:
+                last_end = max(end for _, end in packets)
+                buffer = buffer[last_end:]
+
+            # Safety: don't let buffer grow unbounded
+            if len(buffer) > 2048:
+                # Keep only the tail — any valid packet start is at most ~120 bytes back
                 buffer = buffer[-512:]
-        else:
-            time.sleep(0.1)
 
-    logger.warning("Timeout waiting for response FNC=0x%02X", expected_fnc)
-    return None
+        logger.warning("Timeout waiting for response FNC=0x%02X (buffer had %d bytes)",
+                        expected_fnc, len(buffer))
+        if buffer:
+            logger.debug("Remaining buffer: %s", buffer[:64].hex())
+        return None
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Direct communication mode
+# Direct mode: request-response polling
 # ──────────────────────────────────────────────────────────────────────
 
-def poll_direct(ser: serial.Serial, mqtt_client: HewalexMQTT):
-    """
-    Direct mode: send register read requests and process responses.
-    Also processes any pending write commands.
-    """
-    global write_queue
+def send_and_receive(conn: SerialConnection, request: bytes,
+                     expected_fnc: int) -> dict | None:
+    """Flush stale data, send request, read response."""
+    conn.flush_input()
+    conn.send(request)
+    return conn.read_packet(expected_fnc, timeout=5.0)
 
-    # 1. Process pending writes first
-    while write_queue:
-        reg_name, value = write_queue.pop(0)
-        result = encode_config_value(reg_name, value)
-        if result is None:
-            logger.error("Failed to encode write for %s = %s", reg_name, value)
-            continue
 
-        reg_offset, raw_value = result
-        logger.info("Writing config: %s (offset=%d) = %d (raw=0x%04X)",
-                     reg_name, reg_offset, raw_value, raw_value)
-
-        req = build_write_request(
-            DEV_HARD_ID, CON_HARD_ID,
-            DEV_SOFT_ID, CON_SOFT_ID,
-            CONFIG_REG_BASE, reg_offset,
-            raw_value, CONFIG_REG_COUNT
-        )
-        resp = send_and_receive(ser, req, FNC_READ_CONFIG_RESP, timeout=5)
-        if resp and 'reg_data' in resp:
-            logger.info("Write confirmed for %s", reg_name)
-        else:
-            logger.warning("No confirmation for write to %s", reg_name)
-
-        time.sleep(0.5)  # small delay between operations
-
-    # 2. Read status registers
+def read_status(conn: SerialConnection) -> list[int] | None:
+    """Read status registers from PCWU. Returns raw register list or None."""
     req = build_read_request(
         DEV_HARD_ID, CON_HARD_ID,
         DEV_SOFT_ID, CON_SOFT_ID,
         FNC_READ_STATUS_REQ, STATUS_REG_BASE, STATUS_REG_COUNT
     )
-    resp = send_and_receive(ser, req, FNC_READ_STATUS_RESP, timeout=5)
-
+    resp = send_and_receive(conn, req, FNC_READ_STATUS_RESP)
     if resp and 'reg_data' in resp:
         raw_regs = extract_registers(resp['reg_data'], resp.get('reg_count', STATUS_REG_COUNT))
-        if raw_regs:
-            parsed = parse_status_registers(raw_regs)
-            logger.debug("Status: %s", parsed)
-            mqtt_client.publish_status(parsed)
-
-            if LOG_LEVEL == 'DEBUG':
-                mqtt_client.publish_raw_registers('status', STATUS_REG_BASE, raw_regs)
+        if len(raw_regs) >= 14:  # minimum: we need at least T1-T10 + status
+            return raw_regs
+        else:
+            logger.warning("Status response too short: %d registers", len(raw_regs))
     else:
-        logger.warning("Failed to read status registers")
+        logger.warning("No valid status response received")
+    return None
 
-    time.sleep(1)  # gap between requests
 
-    # 3. Read config registers
+def read_config(conn: SerialConnection) -> list[int] | None:
+    """Read config registers from PCWU. Returns raw register list or None."""
     req = build_read_request(
         DEV_HARD_ID, CON_HARD_ID,
         DEV_SOFT_ID, CON_SOFT_ID,
         FNC_READ_CONFIG_REQ, CONFIG_REG_BASE, CONFIG_REG_COUNT
     )
-    resp = send_and_receive(ser, req, FNC_READ_CONFIG_RESP, timeout=5)
-
+    resp = send_and_receive(conn, req, FNC_READ_CONFIG_RESP)
     if resp and 'reg_data' in resp:
         raw_regs = extract_registers(resp['reg_data'], resp.get('reg_count', CONFIG_REG_COUNT))
-        if raw_regs:
-            parsed = parse_config_registers(raw_regs)
-            logger.debug("Config: %s", parsed)
-            mqtt_client.publish_config(parsed)
-
-            if LOG_LEVEL == 'DEBUG':
-                mqtt_client.publish_raw_registers('config', CONFIG_REG_BASE, raw_regs)
+        if len(raw_regs) >= 10:  # minimum sanity check
+            return raw_regs
+        else:
+            logger.warning("Config response too short: %d registers", len(raw_regs))
     else:
-        logger.warning("Failed to read config registers")
+        logger.warning("No valid config response received")
+    return None
+
+
+def write_config_register(conn: SerialConnection, reg_name: str, value) -> bool:
+    """
+    Write a single config register using read-modify-write.
+
+    1. Use cached config registers (from last read_config)
+    2. Modify the target register
+    3. Send the entire block back with sub_fnc=0xA0
+    4. Read the response to confirm
+    """
+    global cached_config_regs
+
+    if cached_config_regs is None:
+        logger.warning("Cannot write %s: no cached config registers. "
+                        "Will read first on next poll cycle.", reg_name)
+        return False
+
+    # Encode the user value to a register offset + raw 16-bit value
+    encoded = encode_config_value(reg_name, value)
+    if encoded is None:
+        logger.error("Failed to encode %s = %s", reg_name, value)
+        return False
+
+    reg_offset, raw_value = encoded
+    if reg_offset >= len(cached_config_regs):
+        logger.error("Register offset %d out of range (have %d cached regs)",
+                      reg_offset, len(cached_config_regs))
+        return False
+
+    # Modify the cached block
+    old_value = cached_config_regs[reg_offset]
+    cached_config_regs[reg_offset] = raw_value
+    logger.info("Writing %s: offset=%d old=0x%04X new=0x%04X",
+                 reg_name, reg_offset, old_value, raw_value)
+
+    # Build and send the write-back request with the full modified block
+    reg_data = registers_to_bytes(cached_config_regs)
+    req = build_write_request(
+        DEV_HARD_ID, CON_HARD_ID,
+        DEV_SOFT_ID, CON_SOFT_ID,
+        CONFIG_REG_BASE, len(cached_config_regs),
+        reg_data
+    )
+
+    resp = send_and_receive(conn, req, FNC_READ_CONFIG_RESP)
+    if resp and 'reg_data' in resp:
+        # Update cache with the confirmed values from the device
+        confirmed_regs = extract_registers(resp['reg_data'],
+                                            resp.get('reg_count', CONFIG_REG_COUNT))
+        if confirmed_regs:
+            cached_config_regs = confirmed_regs
+            if reg_offset < len(confirmed_regs):
+                if confirmed_regs[reg_offset] == raw_value:
+                    logger.info("Write confirmed: %s = 0x%04X", reg_name, raw_value)
+                    return True
+                else:
+                    logger.warning("Write NOT confirmed: %s expected=0x%04X got=0x%04X",
+                                    reg_name, raw_value, confirmed_regs[reg_offset])
+                    return False
+        logger.info("Write sent, response received (could not verify value)")
+        return True
+    else:
+        # Revert cache on failure
+        cached_config_regs[reg_offset] = old_value
+        logger.error("Write failed: no response for %s", reg_name)
+        return False
+
+
+def poll_direct(conn: SerialConnection, mqtt_client: HewalexMQTT):
+    """
+    Direct mode: one poll cycle.
+
+    Order: process writes → read status → read config.
+    Inter-request delay of 1s to avoid overwhelming the RS485 bus.
+    """
+    global write_queue, cached_config_regs
+
+    # 1. Process pending writes (needs cached config from a prior read)
+    writes_processed = []
+    while write_queue:
+        reg_name, value = write_queue.pop(0)
+        success = write_config_register(conn, reg_name, value)
+        writes_processed.append((reg_name, value, success))
+        time.sleep(1.0)
+
+    # 2. Read status registers
+    raw_status = read_status(conn)
+    if raw_status:
+        parsed = parse_status_registers(raw_status)
+        mqtt_client.publish_status(parsed)
+        if LOG_LEVEL == 'DEBUG':
+            mqtt_client.publish_raw_registers('status', STATUS_REG_BASE, raw_status)
+            logger.debug("Status: %s", {k: v for k, v in parsed.items()
+                                         if k.startswith('T') or k.endswith('ON')})
+
+    time.sleep(1.0)
+
+    # 3. Read config registers (and cache for future writes)
+    raw_config = read_config(conn)
+    if raw_config:
+        cached_config_regs = list(raw_config)  # cache a copy for write-back
+        parsed = parse_config_registers(raw_config)
+        mqtt_client.publish_config(parsed)
+        if LOG_LEVEL == 'DEBUG':
+            mqtt_client.publish_raw_registers('config', CONFIG_REG_BASE, raw_config)
+            logger.debug("Config: %s", parsed)
+
+    # Log write results after re-reading (so HA state is up to date)
+    for reg_name, value, success in writes_processed:
+        if success:
+            logger.info("Write complete: %s = %s", reg_name, value)
+        else:
+            logger.warning("Write may have failed: %s = %s", reg_name, value)
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Eavesdrop communication mode
+# Eavesdrop mode: passive packet capture
 # ──────────────────────────────────────────────────────────────────────
 
-def poll_eavesdrop(ser: serial.Serial, mqtt_client: HewalexMQTT):
+def run_eavesdrop(conn: SerialConnection, mqtt_client: HewalexMQTT):
     """
-    Eavesdrop mode: passively listen for G-426 ↔ PCWU traffic.
+    Eavesdrop mode: passively listen to G-426 ↔ PCWU traffic.
 
-    In this mode we cannot send commands; we just parse responses
-    that the PCWU sends to the G-426 controller and extract data.
+    Runs in a continuous loop (not per-poll). Captures response packets
+    from the PCWU and publishes their contents. Cannot send commands.
     """
+    logger.info("Entering eavesdrop mode — listening for traffic...")
     buffer = b''
-    read_timeout = POLL_INTERVAL
-
-    ser.timeout = read_timeout
+    last_status_time = 0
+    last_config_time = 0
 
     while running:
         try:
-            chunk = ser.read(512)
+            conn.ser.timeout = 2.0
+            chunk = conn.ser.read(512)
             if chunk:
                 buffer += chunk
 
@@ -255,34 +415,44 @@ def poll_eavesdrop(ser: serial.Serial, mqtt_client: HewalexMQTT):
                             parsed['reg_data'],
                             parsed.get('reg_count', STATUS_REG_COUNT)
                         )
-                        if raw_regs:
+                        if raw_regs and len(raw_regs) >= 14:
                             status = parse_status_registers(raw_regs)
-                            logger.debug("Eavesdrop status: %s", status)
                             mqtt_client.publish_status(status)
+                            last_status_time = time.time()
+                            logger.debug("Eavesdrop: status update (%d regs)", len(raw_regs))
 
                     elif fnc == FNC_READ_CONFIG_RESP and 'reg_data' in parsed:
                         raw_regs = extract_registers(
                             parsed['reg_data'],
                             parsed.get('reg_count', CONFIG_REG_COUNT)
                         )
-                        if raw_regs:
+                        if raw_regs and len(raw_regs) >= 10:
                             config = parse_config_registers(raw_regs)
-                            logger.debug("Eavesdrop config: %s", config)
                             mqtt_client.publish_config(config)
+                            last_config_time = time.time()
+                            logger.debug("Eavesdrop: config update (%d regs)", len(raw_regs))
 
-                # Keep only unprocessed data in buffer
+                # Trim processed data
                 if packets:
-                    last_end = packets[-1][1]
+                    last_end = max(end for _, end in packets)
                     buffer = buffer[last_end:]
 
-                # Prevent buffer from growing unbounded
                 if len(buffer) > 4096:
                     buffer = buffer[-2048:]
 
+            # Log if we haven't seen data in a while
+            now = time.time()
+            if last_status_time and (now - last_status_time > 120):
+                logger.warning("No status update in >120s — check RS485 connection")
+                last_status_time = now  # reset to avoid spamming
+
         except serial.SerialTimeoutException:
             continue
+        except serial.SerialException as e:
+            logger.error("Eavesdrop serial error: %s", e)
+            raise  # let main loop handle reconnection
         except Exception as e:
-            logger.error("Eavesdrop error: %s", e)
+            logger.error("Eavesdrop error: %s", e, exc_info=True)
             time.sleep(1)
 
 
@@ -293,11 +463,10 @@ def poll_eavesdrop(ser: serial.Serial, mqtt_client: HewalexMQTT):
 def on_ha_command(register_name: str, value):
     """Queue a write command from Home Assistant."""
     if MODE == 'eavesdrop':
-        logger.warning("Cannot write in eavesdrop mode, ignoring command: %s = %s",
-                        register_name, value)
+        logger.warning("Cannot write in eavesdrop mode: %s = %s", register_name, value)
         return
 
-    logger.info("Queuing write command: %s = %s", register_name, value)
+    logger.info("Queuing write: %s = %s", register_name, value)
     write_queue.append((register_name, value))
 
 
@@ -309,7 +478,7 @@ def main():
     global running
 
     logger.info("=" * 60)
-    logger.info("Hewalex PCWU Add-on starting")
+    logger.info("Hewalex PCWU Add-on v1.0.1 starting")
     logger.info("  Mode: %s", MODE)
     logger.info("  Device: %s:%d", DEVICE_ADDRESS, DEVICE_PORT)
     logger.info("  MQTT: %s:%d", MQTT_HOST, MQTT_PORT)
@@ -336,60 +505,55 @@ def main():
         sys.exit(1)
 
     # Wait for MQTT connection
-    for _ in range(30):
+    for i in range(30):
         if mqtt_client.connected:
             break
         time.sleep(1)
     else:
-        logger.error("MQTT connection timeout")
+        logger.error("MQTT connection timeout after 30s")
         sys.exit(1)
 
-    # Main loop with automatic reconnection
-    ser = None
+    logger.info("MQTT connected, starting main loop")
+
+    # Serial connection (persistent)
+    conn = SerialConnection(DEVICE_ADDRESS, DEVICE_PORT)
     consecutive_errors = 0
 
     while running:
         try:
-            # Open serial/TCP connection if needed
-            if ser is None or not ser.is_open:
+            # Ensure connection is open
+            if not conn.is_open:
                 try:
-                    ser = open_connection()
+                    conn.connect()
                     consecutive_errors = 0
-                    logger.info("Serial connection established")
                 except Exception as e:
                     consecutive_errors += 1
                     backoff = min(consecutive_errors * 5, 60)
-                    logger.error("Connection failed (%d): %s. Retrying in %ds",
+                    logger.error("Connection failed (#%d): %s — retry in %ds",
                                   consecutive_errors, e, backoff)
                     time.sleep(backoff)
                     continue
 
             if MODE == 'eavesdrop':
-                # Eavesdrop mode runs its own inner loop
-                poll_eavesdrop(ser, mqtt_client)
+                run_eavesdrop(conn, mqtt_client)
             else:
-                # Direct mode: poll, sleep, repeat
-                poll_direct(ser, mqtt_client)
+                # Direct mode: poll cycle
+                poll_direct(conn, mqtt_client)
                 consecutive_errors = 0
 
-                # Sleep between polls (interruptible)
+                # Interruptible sleep between polls
                 for _ in range(POLL_INTERVAL * 2):
                     if not running:
                         break
-                    # Check for pending writes more frequently
                     if write_queue:
+                        logger.debug("Write pending, interrupting sleep")
                         break
                     time.sleep(0.5)
 
         except serial.SerialException as e:
             logger.error("Serial error: %s", e)
             consecutive_errors += 1
-            if ser:
-                try:
-                    ser.close()
-                except Exception:
-                    pass
-                ser = None
+            conn.close()
             backoff = min(consecutive_errors * 5, 60)
             logger.info("Reconnecting in %ds...", backoff)
             time.sleep(backoff)
@@ -397,12 +561,12 @@ def main():
         except Exception as e:
             logger.error("Unexpected error: %s", e, exc_info=True)
             consecutive_errors += 1
+            conn.close()
             time.sleep(5)
 
     # Cleanup
     logger.info("Shutting down...")
-    if ser and ser.is_open:
-        ser.close()
+    conn.close()
     mqtt_client.disconnect()
     logger.info("Goodbye!")
 
