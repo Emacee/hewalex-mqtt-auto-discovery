@@ -14,17 +14,26 @@ Packet format:
     [3]    0x84        Fixed header byte
     [4]    0x00        Fixed
     [5]    0x00        Fixed
-    [6]    payload_len Payload byte count (everything after header)
+    [6]    payload_len Payload byte count (everything after header incl CRC)
     [7]    hdr_crc     CRC-8/DVB-S2 over bytes [0..6]
 
   PAYLOAD (variable length):
-    [0]    dst_soft    Target logical address
-    [1]    0x00        Reserved
-    [2]    src_soft    Sender logical address
-    [3]    0x00        Reserved
-    [4]    fnc         Function code
-    [5..]  data        Function-specific data
-    [-2:]  crc16       CRC-16 over payload bytes [0..-2]
+    [0]    dst_soft       Target logical address
+    [1]    0x00           Reserved
+    [2]    src_soft       Sender logical address
+    [3]    0x00           Reserved
+    [4]    fnc            Function code
+    [5]    sub_fnc        Sub-function (0x80=read, 0xA0=write)
+    [6]    0x00           Reserved
+    [7]    reg_count      Number of 16-bit registers
+    [8]    reg_start_lo   Register start address LOW byte
+    [9]    reg_start_hi   Register start address HIGH byte
+    [10..] data           Register data (responses / writes only)
+    [-2:]  crc16          CRC-16 over all payload bytes EXCEPT last 2
+
+  Register start is 16-bit LITTLE-ENDIAN:
+    status  base=100 → lo=0x64, hi=0x00
+    config  base=300 → lo=0x2C, hi=0x01
 
 Function codes:
   0x40 = Read status registers (request)
@@ -42,12 +51,23 @@ START_BYTE = 0x69
 HEADER_FIXED_BYTE = 0x84
 HEADER_LEN = 8
 
+# Payload field offsets (within payload_data, i.e. payload minus CRC)
+PL_DST_SOFT = 0
+PL_SRC_SOFT = 2
+PL_FNC = 4
+PL_SUB_FNC = 5
+PL_REG_COUNT = 7
+PL_REG_START_LO = 8
+PL_REG_START_HI = 9
+PL_DATA_START = 10   # register data begins HERE, not at [9]
+
 FNC_READ_STATUS_REQ = 0x40
 FNC_READ_STATUS_RESP = 0x50
 FNC_READ_CONFIG_REQ = 0x60
 FNC_READ_CONFIG_RESP = 0x70
-FNC_WRITE_CONFIG_REQ = 0x60
-FNC_WRITE_CONFIG_RESP = 0x70
+
+SUB_FNC_READ = 0x80
+SUB_FNC_WRITE = 0xA0
 
 
 def crc8_dvb_s2(data: bytes, crc: int = 0) -> int:
@@ -108,9 +128,16 @@ def build_read_request(dst_hard: int, src_hard: int,
 
     For status registers: fnc=0x40, reg_start=100
     For config registers: fnc=0x60, reg_start=300
+
+    Register start is encoded as 16-bit little-endian.
     """
-    # Function-specific data: [0x80, 0x00, reg_count, reg_start, 0x00]
-    func_data = bytes([0x80, 0x00, reg_count & 0xFF, reg_start & 0xFF, 0x00])
+    func_data = bytes([
+        SUB_FNC_READ,
+        0x00,
+        reg_count & 0xFF,
+        reg_start & 0xFF,          # low byte
+        (reg_start >> 8) & 0xFF,   # high byte
+    ])
     payload = build_payload(dst_soft, src_soft, fnc, func_data)
     header = build_header(dst_hard, src_hard, len(payload))
     return header + payload
@@ -118,31 +145,28 @@ def build_read_request(dst_hard: int, src_hard: int,
 
 def build_write_request(dst_hard: int, src_hard: int,
                         dst_soft: int, src_soft: int,
-                        reg_start: int, reg_index: int,
-                        value: int, total_regs: int = 50) -> bytes:
+                        reg_start: int, reg_count: int,
+                        reg_data: bytes) -> bytes:
     """
-    Build a config register write request.
+    Build a config register write-back request (read-modify-write pattern).
 
-    The write uses FNC 0x60 with a different sub-function.
-    reg_index is the register offset from reg_start.
-    value is the 16-bit value to write.
+    Uses FNC=0x60, sub=0xA0. Sends the full register block back with
+    modified values.
+
+    Args:
+        reg_start: base register address (e.g. 300)
+        reg_count: number of 16-bit registers (e.g. 50)
+        reg_data:  raw bytes for ALL registers (reg_count * 2 bytes)
     """
-    # Write single register format:
-    # FNC=0x60, sub_fnc=0xA0, 0x00, total_regs, reg_start,
-    # then reg_index as 2-byte offset into the block,
-    # then 2-byte value
     func_data = bytes([
-        0xA0, 0x00,
-        total_regs & 0xFF,
-        reg_start & 0xFF,
+        SUB_FNC_WRITE,
         0x00,
-    ])
-    # Register offset within the block (which register to write)
-    func_data += struct.pack('>H', reg_index)
-    # Value to write
-    func_data += struct.pack('>H', value & 0xFFFF)
+        reg_count & 0xFF,
+        reg_start & 0xFF,           # low byte
+        (reg_start >> 8) & 0xFF,    # high byte
+    ]) + reg_data
 
-    payload = build_payload(dst_soft, src_soft, FNC_WRITE_CONFIG_REQ, func_data)
+    payload = build_payload(dst_soft, src_soft, FNC_READ_CONFIG_REQ, func_data)
     header = build_header(dst_hard, src_hard, len(payload))
     return header + payload
 
@@ -159,7 +183,6 @@ def parse_packet(data: bytes) -> dict | None:
         return None
 
     if data[0] != START_BYTE:
-        logger.debug("Invalid start byte: 0x%02X", data[0])
         return None
 
     # Parse header
@@ -197,10 +220,10 @@ def parse_packet(data: bytes) -> dict | None:
                       payload_crc_calc, payload_crc_expected)
         return None
 
-    # Parse payload fields
-    dst_soft = payload[0]
-    src_soft = payload[2]
-    fnc = payload[4]
+    # Parse payload addressing fields
+    dst_soft = payload_data[PL_DST_SOFT]
+    src_soft = payload_data[PL_SRC_SOFT]
+    fnc = payload_data[PL_FNC]
 
     result = {
         'dst_hard': dst_hard,
@@ -212,31 +235,36 @@ def parse_packet(data: bytes) -> dict | None:
         'total_len': HEADER_LEN + payload_len,
     }
 
-    # Parse function-specific data
-    if fnc in (FNC_READ_STATUS_RESP, FNC_READ_CONFIG_RESP):
-        # Response format: [addr(4)] [fnc(1)] [sub(1)] [0x00] [reg_count] [reg_start] [data...]
-        if len(payload_data) >= 9:
-            sub_fnc = payload_data[5]
-            reg_count = payload_data[7]
-            reg_start = payload_data[8]
-            reg_data = payload_data[9:]
+    # Parse register-related fields (present in both requests and responses)
+    if len(payload_data) >= PL_DATA_START:
+        sub_fnc = payload_data[PL_SUB_FNC]
+        reg_count = payload_data[PL_REG_COUNT]
 
-            result['sub_fnc'] = sub_fnc
-            result['reg_start'] = reg_start
-            result['reg_count'] = reg_count
+        # 16-bit little-endian register start address
+        reg_start = (payload_data[PL_REG_START_LO] |
+                     (payload_data[PL_REG_START_HI] << 8))
+
+        result['sub_fnc'] = sub_fnc
+        result['reg_start'] = reg_start
+        result['reg_count'] = reg_count
+
+        # Extract register data (responses only)
+        if fnc in (FNC_READ_STATUS_RESP, FNC_READ_CONFIG_RESP):
+            reg_data = payload_data[PL_DATA_START:]
             result['reg_data'] = reg_data
 
-            logger.debug("Response: FNC=0x%02X sub=0x%02X start=%d count=%d data_len=%d",
-                          fnc, sub_fnc, reg_start, reg_count, len(reg_data))
-
-    elif fnc in (FNC_READ_STATUS_REQ, FNC_READ_CONFIG_REQ):
-        if len(payload_data) >= 9:
-            sub_fnc = payload_data[5]
-            reg_count = payload_data[7]
-            reg_start = payload_data[8]
-            result['sub_fnc'] = sub_fnc
-            result['reg_start'] = reg_start
-            result['reg_count'] = reg_count
+            expected_bytes = reg_count * 2
+            if len(reg_data) != expected_bytes:
+                logger.warning(
+                    "Response data length mismatch: FNC=0x%02X start=%d "
+                    "count=%d data_len=%d expected=%d",
+                    fnc, reg_start, reg_count, len(reg_data), expected_bytes
+                )
+            else:
+                logger.debug(
+                    "Response OK: FNC=0x%02X start=%d count=%d (%d bytes)",
+                    fnc, reg_start, reg_count, len(reg_data)
+                )
 
     return result
 
@@ -246,13 +274,12 @@ def find_packets(buffer: bytes) -> list[tuple[dict, int]]:
     Find all valid GECO packets in a byte buffer.
 
     Returns list of (parsed_packet, end_position) tuples.
-    Useful for eavesdropping mode where multiple packets may arrive.
+    Uses CRC validation to reject false 0x69 matches in register data.
     """
     packets = []
     pos = 0
 
     while pos < len(buffer):
-        # Find next start byte
         idx = buffer.find(bytes([START_BYTE]), pos)
         if idx == -1:
             break
@@ -261,7 +288,6 @@ def find_packets(buffer: bytes) -> list[tuple[dict, int]]:
         if len(remaining) < HEADER_LEN:
             break
 
-        # Check if we have enough data for the full packet
         payload_len = remaining[6]
         total_len = HEADER_LEN + payload_len
 
@@ -292,6 +318,14 @@ def extract_registers(reg_data: bytes, count: int) -> list[int]:
         val = struct.unpack('>H', reg_data[i*2:i*2+2])[0]
         registers.append(val)
     return registers
+
+
+def registers_to_bytes(registers: list[int]) -> bytes:
+    """Convert a list of 16-bit register values back to raw bytes (big-endian)."""
+    result = b''
+    for val in registers:
+        result += struct.pack('>H', val & 0xFFFF)
+    return result
 
 
 def signed16(value: int) -> int:
