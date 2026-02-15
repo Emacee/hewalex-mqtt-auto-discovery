@@ -13,7 +13,6 @@ Register data types:
   bool   - 0=False, 1=True (stored as word)
   mask   - bitmask within a word register
   tprg   - time program (24-bit bitmask, one bit per hour)
-  date   - packed date (high=value1, low=value2)
 
 Sources:
   - https://github.com/Chibald/Hewalex2Mqtt
@@ -29,8 +28,6 @@ logger = logging.getLogger(__name__)
 # ──────────────────────────────────────────────────────────────────────
 # STATUS REGISTER MAP (base=100, request 50 registers → regs 100-149)
 # ──────────────────────────────────────────────────────────────────────
-# offset = register_number - 100
-# Each entry: (offset, name, type, description)
 
 STATUS_REG_BASE = 100
 STATUS_REG_COUNT = 50
@@ -62,7 +59,6 @@ STATUS_REGISTERS = [
 ]
 
 # Bitmask definitions for StatusBits (register offset 14)
-# These map individual bits to named boolean states
 STATUS_BITMASKS = {
     'FanON':              (14, 0x0001),
     'CirculationPumpON':  (14, 0x0002),
@@ -74,7 +70,6 @@ STATUS_BITMASKS = {
 # ──────────────────────────────────────────────────────────────────────
 # CONFIG REGISTER MAP (base=300, request 50 registers → regs 300-349)
 # ──────────────────────────────────────────────────────────────────────
-# Each entry: (offset, name, type, description, writable, min, max)
 
 CONFIG_REG_BASE = 300
 CONFIG_REG_COUNT = 50
@@ -90,8 +85,6 @@ CONFIG_REGISTERS = [
     (6,  'TapWaterHysteresis',   'te10', 'Start-up hysteresis (°C)',          True,  20, 100),
     (7,  'AmbientMinTemp',       'te10', 'Min ambient temp (°C)',             True, -100, 100),
 
-    # Time programs: each is 3 consecutive 8-bit values packed into registers
-    # representing 24 hours (1 bit per hour), but stored across reg boundaries
     (8,  'TimeProgramHPM_F_hi',  'word', 'Time program HP Mon-Fri (hi)',      True, 0, 65535),
     (9,  'TimeProgramHPM_F_lo',  'word', 'Time program HP Mon-Fri (lo)',      True, 0, 65535),
     (10, 'TimeProgramHPSat_hi',  'word', 'Time program HP Saturday (hi)',     True, 0, 65535),
@@ -99,43 +92,30 @@ CONFIG_REGISTERS = [
     (12, 'TimeProgramHPSun_hi',  'word', 'Time program HP Sunday (hi)',       True, 0, 65535),
     (13, 'TimeProgramHPSun_lo',  'word', 'Time program HP Sunday (lo)',       True, 0, 65535),
 
-    # Protection and operation settings
     (14, 'AntiFreezingEnabled',      'bool', 'Anti-freezing protection',      True,  0, 1),
     (15, 'WaterPumpOperationMode',   'word', 'Pump mode (0=Continuous,1=Synchronous)', True, 0, 1),
     (16, 'FanOperationMode',         'word', 'Fan mode (0=Max,1=Min,2=Day/Night)',     True, 0, 2),
 
-    # Defrosting parameters
     (17, 'DefrostingInterval',   'word', 'Defrost delay (30-90 min)',         True, 30, 90),
     (18, 'DefrostingStartTemp',  'te10', 'Defrost start temp (°C)',           True, -300, 0),
     (19, 'DefrostingStopTemp',   'te10', 'Defrost stop temp (°C)',            True, 20, 300),
     (20, 'DefrostingMaxTime',    'word', 'Max defrost duration (1-12 min)',   True, 1, 12),
 
-    # Additional controls
     (21, 'ExtControllerHPOFF',   'bool', 'External HP deactivation',         True, 0, 1),
 
-    # Circulation pump settings
     (22, 'CircPumpMinTemp',      'te10', 'Min circ pump temp (°C)',           True, 200, 600),
     (23, 'CircPumpMode',         'word', 'Circ pump mode (0=Intermittent,1=Continuous)', True, 0, 1),
 ]
 
-# Time program helper: map friendly names to register pairs
 TIME_PROGRAMS = {
-    'TimeProgramHPM_F':  (8, 9),    # Mon-Fri
-    'TimeProgramHPSat':  (10, 11),   # Saturday
-    'TimeProgramHPSun':  (12, 13),   # Sunday
+    'TimeProgramHPM_F':  (8, 9),
+    'TimeProgramHPSat':  (10, 11),
+    'TimeProgramHPSun':  (12, 13),
 }
 
 
 def parse_status_registers(raw_regs: list[int]) -> dict:
-    """
-    Parse raw status register values into a named dictionary.
-
-    Args:
-        raw_regs: list of unsigned 16-bit values (from extract_registers)
-
-    Returns:
-        dict with named values, temperatures in °C, booleans as True/False
-    """
+    """Parse raw status register values into a named dictionary."""
     result = {}
 
     for offset, name, dtype, desc in STATUS_REGISTERS:
@@ -159,7 +139,7 @@ def parse_status_registers(raw_regs: list[int]) -> dict:
             result['Minute'] = val & 0xFF
         elif dtype == 'time_s':
             result['Second'] = (val >> 8) & 0xFF
-        else:  # word
+        else:
             result[name] = val
 
     # Extract bitmask flags
@@ -171,15 +151,7 @@ def parse_status_registers(raw_regs: list[int]) -> dict:
 
 
 def parse_config_registers(raw_regs: list[int]) -> dict:
-    """
-    Parse raw config register values into a named dictionary.
-
-    Args:
-        raw_regs: list of unsigned 16-bit values
-
-    Returns:
-        dict with named values
-    """
+    """Parse raw config register values into a named dictionary."""
     result = {}
 
     for entry in CONFIG_REGISTERS:
@@ -194,16 +166,14 @@ def parse_config_registers(raw_regs: list[int]) -> dict:
             result[name] = signed16(val) / 10.0
         elif dtype == 'bool':
             result[name] = bool(val)
-        else:  # word
+        else:
             result[name] = val
 
-    # Build combined time program strings
     for prog_name, (hi_off, lo_off) in TIME_PROGRAMS.items():
         if hi_off < len(raw_regs) and lo_off < len(raw_regs):
             hi = raw_regs[hi_off]
             lo = raw_regs[lo_off]
             combined = (hi << 16) | lo
-            # Build hour-by-hour string: "1" = on, "0" = off for hours 0-23
             hours = ''.join('1' if combined & (1 << i) else '0' for i in range(24))
             result[prog_name] = hours
 
@@ -214,12 +184,7 @@ def encode_config_value(name: str, user_value) -> tuple[int, int] | None:
     """
     Encode a user-provided value for writing to a config register.
 
-    Args:
-        name: register name
-        user_value: value from the user (str, int, float, bool)
-
-    Returns:
-        (register_offset, raw_16bit_value) or None if invalid
+    Returns (register_offset, raw_16bit_value) or None if invalid.
     """
     for entry in CONFIG_REGISTERS:
         offset, reg_name, dtype, desc, writable = entry[0], entry[1], entry[2], entry[3], entry[4]
@@ -234,20 +199,19 @@ def encode_config_value(name: str, user_value) -> tuple[int, int] | None:
 
         if dtype == 'te10':
             raw = int(float(user_value) * 10)
-            check_val = raw  # check BEFORE two's complement conversion
+            check_val = raw  # check BEFORE two's complement
             if raw < 0:
-                raw = raw & 0xFFFF  # two's complement for signed
+                raw = raw & 0xFFFF
         elif dtype == 'bool':
             if isinstance(user_value, str):
                 raw = 1 if user_value.lower() in ('true', '1', 'on', 'yes') else 0
             else:
                 raw = 1 if user_value else 0
             check_val = raw
-        else:  # word
+        else:
             raw = int(user_value)
             check_val = raw
 
-        # Range check on the logical value (before two's complement)
         if min_val is not None and max_val is not None:
             if check_val < min_val or check_val > max_val:
                 logger.warning("Value %s for %s out of range [%s, %s]",
@@ -266,12 +230,7 @@ def get_writable_configs() -> list[dict]:
     for entry in CONFIG_REGISTERS:
         offset, name, dtype, desc, writable = entry[0], entry[1], entry[2], entry[3], entry[4]
         if writable:
-            info = {
-                'name': name,
-                'type': dtype,
-                'description': desc,
-                'offset': offset,
-            }
+            info = {'name': name, 'type': dtype, 'description': desc, 'offset': offset}
             if len(entry) > 5:
                 info['min'] = entry[5]
             if len(entry) > 6:
