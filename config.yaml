@@ -1,6 +1,6 @@
 name: "Hewalex PCWU"
 description: "Hewalex PCWU heat pump integration via MQTT with Home Assistant auto-discovery"
-version: "1.0.0"
+version: "1.0.1"
 slug: "hewalex_pcwu"
 url: "https://github.com/Emacee/hewalex-mqtt-auto-discovery/"
 arch:
