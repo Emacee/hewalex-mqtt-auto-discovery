@@ -1,163 +1,143 @@
-# Hewalex PCWU - Home Assistant Add-on
+# Hewalex PCWU
 
-Control and monitor your Hewalex PCWU heat pump directly from Home Assistant.
+Monitor and control a Hewalex PCWU heat pump (G-426 controller) from Home
+Assistant. The add-on talks to the heat pump over RS485 through a
+RS485-to-WiFi/Ethernet adapter (or a USB adapter) and publishes everything with
+MQTT discovery: a **Hewalex PCWU** device appears automatically under
+*Settings → Devices & services → MQTT*.
 
-## Overview
+## Requirements
 
-This add-on connects to your Hewalex PCWU heat pump via a Waveshare (or similar)
-RS485-to-WiFi/Ethernet adapter, reads sensor data and configuration, and publishes
-everything to MQTT with **Home Assistant auto-discovery** — entities appear
-automatically in your HA dashboard.
+- An MQTT broker. With the **Mosquitto broker** add-on installed and the MQTT
+  integration set up, nothing has to be configured; otherwise fill in
+  `mqtt_host` and friends.
+- A RS485 adapter: Elfin EW11, Waveshare RS485-to-WiFi/ETH, USR-W610, … in
+  *TCP server* mode, **38400 baud, 8 data bits, no parity, 1 stop bit**
+  (or a USB-RS485 stick, see `device_address`).
 
-### Supported Hardware
+## Wiring
 
-- **Heat pumps**: Hewalex PCWU 2.5kW, PCWU 3.0kW (and variants)
-- **Controllers**: GECO G-426
-- **Adapters**: Any RS485-to-WiFi/Ethernet bridge (Waveshare, Elfin EW11, USR-W610, etc.)
+### Direct mode (recommended, read + write)
 
-### Features
+The PCWU main board has two RS485 ports. The G-426 controller uses one of
+them; the other one is free.
 
-- 10 temperature sensors (T1–T10)
-- Equipment status (compressor, fan, pump, heater)
-- Full config control (target temp, hysteresis, fan mode, defrost settings, etc.)
-- Two communication modes (Direct and Eavesdrop)
-- MQTT auto-discovery for seamless HA integration
-- Automatic reconnection on connection loss
+1. Switch the heat pump off at the mains and open the fuse/connection box.
+2. Connect A, B (and GND, optionally +12 V to power the adapter) of the free
+   RS485 port to the adapter. Copy the colour coding of the port that goes to
+   the controller.
+3. On the G-426 controller open the RS485 settings of the free port and set
+   baud rate **38400**, physical address **2** and logical address **2**.
+   (Factory values are 255 / 65535, which do not work.)
+4. Configure the adapter for 38400 8N1, TCP server, and give it a fixed IP.
 
-## Hardware Setup
+The add-on is master on this port; the controller keeps working as usual on
+the other one.
 
-### Option A: Direct Communication (Recommended)
+### Eavesdrop mode (read only)
 
-Connect your RS485 adapter to the **dedicated (free) RS485 port** on the PCWU
-mainboard. This allows both reading and writing.
+Connect the adapter in parallel to A and B of the cable between G-426 and the
+heat pump. The PCWU sends its status to the controller twice a second; the
+add-on decodes that. Settings cannot be read or changed in this mode, so only
+temperatures and status entities are created.
 
-1. Open the PCWU fuse box
-2. Find the free RS485 connector (1st port; the 2nd is used by the G-426 controller)
-3. Wire A, B and optionally +12V/GND to your RS485 adapter
-4. On the G-426 controller, go to RS485 settings for port 1:
-   - Baud rate: **38400**
-   - Physical address: **2**
-   - Logical address: **2**
-5. Configure your WiFi/Ethernet adapter to match (38400 8N1, TCP server mode)
+## Options
 
-### Option B: Eavesdropping (Read-Only)
+| Option | Default | |
+|---|---|---|
+| `device_address` | `192.168.1.100` | IP address of the adapter, or a serial device such as `/dev/ttyUSB0` |
+| `device_port` | `8899` | TCP port of the adapter (ignored for a serial device) |
+| `mode` | `direct` | `direct` (read + write) or `eavesdrop` (read only) |
+| `poll_interval` | `30` | Seconds between reads (direct) / state updates (eavesdrop) |
+| `expert_mode` | `false` | Also expose installer settings, see below |
+| `controller_hard_id` / `controller_soft_id` | `1` / `1` | Address the add-on uses as master |
+| `device_hard_id` / `device_soft_id` | `2` / `2` | Physical / logical address set on the controller for the free port |
+| `mqtt_host` … `mqtt_password` | empty | Only needed when not using the Mosquitto add-on |
+| `mqtt_topic_prefix` | `hewalex` | State topics: `hewalex/<key>`, commands: `hewalex/<key>/set` |
+| `mqtt_discovery_prefix` | `homeassistant` | Must match the MQTT integration |
+| `log_level` | `info` | `debug` logs every frame and publishes raw register dumps on `hewalex/debug/#` |
 
-Tap into the existing RS485 bus between the G-426 and the PCWU by wiring your
-adapter **in parallel** to the A and B lines. This is read-only.
+## Entities
 
-> **Warning**: Eavesdrop mode cannot send any commands to the heat pump.
+### Measurements and status
 
-## Add-on Configuration
+| Entity | Register | |
+|---|---|---|
+| T1 ambient … T10 after compressor | 128–146 | temperatures (T4 and T5 disabled by default) |
+| Fan, Water pump, Compressor, Electric heater E | 196 bits 0, 2, 11, 12 | running |
+| Operating state | 194, 196, 202 | Heating, Defrosting, Idle, Waiting: …, Error: … |
+| Controller on | 194 | the G-426 display/controller is switched on |
+| Expansion valve position | 198 | steps |
+| Waiting status code, Restart timer | 202, 206 | raw values, diagnostic |
+| Installation scheme | 302 | diagnostic, read only |
+| Schedules (heat pump, heater E) | 314–325, 374–385 | on-hours, e.g. `06:00-22:00` |
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `device_address` | `192.168.1.100` | IP address of your RS485-to-WiFi adapter |
-| `device_port` | `8899` | TCP port of the adapter |
-| `mode` | `direct` | `direct` (read+write) or `eavesdrop` (read-only) |
-| `poll_interval` | `30` | Seconds between register polls (5–300) |
-| `mqtt_host` | *(auto)* | MQTT broker host (auto-detected from HA if empty) |
-| `mqtt_port` | `1883` | MQTT broker port |
-| `mqtt_user` | *(auto)* | MQTT username |
-| `mqtt_password` | *(auto)* | MQTT password |
-| `mqtt_topic_prefix` | `hewalex` | Base MQTT topic |
-| `mqtt_discovery_prefix` | `homeassistant` | HA discovery prefix |
-| `controller_hard_id` | `1` | Controller physical RS485 address |
-| `controller_soft_id` | `1` | Controller logical address |
-| `device_hard_id` | `2` | PCWU physical RS485 address |
-| `device_soft_id` | `2` | PCWU logical address |
-| `log_level` | `info` | Logging verbosity (`debug`, `info`, `warning`, `error`) |
+### Settings (direct mode)
 
-### MQTT Auto-Detection
+| Entity | Register | Range |
+|---|---|---|
+| Heat pump enabled | 304 | on/off |
+| Hot water target | 308 | 10–60 °C |
+| Start hysteresis | 310 | 2–10 °C |
+| Minimum ambient temperature | 312 | −10–10 °C |
+| Controlling sensor | 306 | T2 / T3 / T7 |
+| Frost protection | 326 | on/off |
+| Water pump mode | 328 | Continuous / Synchronous |
+| Fan mode | 330 | Max / Min / Day/Night |
+| Electric heater E enabled | 364 | on/off |
+| Heater E target (heat pump on / off) | 366 / 368 | 30–60 °C |
+| Heater E blocked while heat pump runs | 370 | on/off |
+| Anti-legionella | 498 | on/off |
 
-If you leave `mqtt_host` empty, the add-on will automatically use the MQTT
-broker configured in Home Assistant (via the Mosquitto add-on or external broker).
+### Expert mode
 
-## Entities Created
+Only for installers who know their installation. Adds: defrost interval
+(30–90 min), defrost start (−30–0 °C) and stop (2–30 °C) temperature, maximum
+defrost time (1–12 min), heater P on/off and blocking, circulation pump mode,
+boiler pump priority, anti-legionella heater selection and the four external
+contact switches; plus read-only heater P, circulation pump and boiler pump
+temperatures and the expansion valve mode. The installation scheme and the
+expansion valve parameters are never written.
 
-### Sensors (read-only)
+## How writing works
 
-| Entity | Description |
-|--------|-------------|
-| PCWU T1 Ambient | Outside / inlet air temperature |
-| PCWU T2 Tank Bottom | Water tank bottom temperature |
-| PCWU T3 Tank Top | Water tank top temperature |
-| PCWU T4 Boiler | Solid fuel boiler temperature |
-| PCWU T5 Void | Unused sensor slot |
-| PCWU T6 Water Inlet | Heat pump water inlet |
-| PCWU T7 Water Outlet | Heat pump water outlet |
-| PCWU T8 Evaporator | Evaporator temperature |
-| PCWU T9 Before Compressor | Suction line temperature |
-| PCWU T10 After Compressor | Discharge line temperature |
-| PCWU Expansion Valve | Expansion valve position (steps) |
-| PCWU Waiting Status | 0 = available, 2 = disabled |
+1. The value is checked against the range the controller allows. The PCWU
+   itself silently replaces an invalid value by its factory default, so
+   invalid values are refused before anything is sent.
+2. One 16-bit register is written (function 0x60) and the add-on waits for
+   the PCWU's acknowledge (0x70) for exactly that register.
+3. The register is read back. Home Assistant always shows the value read
+   from the PCWU; if it differs from what was asked, the log says so.
 
-### Binary Sensors (read-only)
-
-| Entity | Description |
-|--------|-------------|
-| PCWU Fan | Fan is running |
-| PCWU Circulation Pump | Circulation pump is running |
-| PCWU Heat Pump | Heat pump is active |
-| PCWU Compressor | Compressor is running |
-| PCWU Electric Heater | Electric heater is on |
-| PCWU Manual Mode | Manual mode is active |
-
-### Controls (read/write, Direct mode only)
-
-| Entity | Type | Range | Description |
-|--------|------|-------|-------------|
-| PCWU Heat Pump Enable | Switch | ON/OFF | Enable/disable heat pump |
-| PCWU Electric Heater Enable | Switch | ON/OFF | Enable/disable heater |
-| PCWU Anti-Freeze Protection | Switch | ON/OFF | Anti-freezing protection |
-| PCWU External HP Deactivation | Switch | ON/OFF | External deactivation |
-| PCWU Target Temperature | Number | 10–60°C | Hot water setpoint |
-| PCWU Start Hysteresis | Number | 2–10°C | Start-up hysteresis |
-| PCWU Min Ambient Temp | Number | −10–10°C | Minimum ambient temperature |
-| PCWU Defrost Interval | Number | 30–90 min | Defrost cycle delay |
-| PCWU Defrost Start Temp | Number | −30–0°C | Defrost activation temp |
-| PCWU Defrost Stop Temp | Number | 2–30°C | Defrost finish temp |
-| PCWU Max Defrost Duration | Number | 1–12 min | Maximum defrost time |
-| PCWU Controlling Sensor | Select | T2/T3/T7 | Which sensor controls HP |
-| PCWU Water Pump Mode | Select | Continuous/Synchronous | Pump operation mode |
-| PCWU Fan Mode | Select | Max/Min/Day-Night | Fan operation mode |
-| PCWU Circ Pump Mode | Select | Intermittent/Continuous | Circulation pump mode |
+Every frame carries a CRC-8 over the header and a CRC-16/XMODEM over the
+payload; frames with a wrong CRC, wrong addresses or a different register
+than requested are ignored. Reads and writes are retried twice.
 
 ## Troubleshooting
 
-### No data / connection errors
+- **Entities unavailable** – the add-on marks the device unavailable after
+  three failed polls. Check the log: `no response` means wrong IP/port, wrong
+  addresses on the controller, A/B swapped or a wrong baud rate; `invalid
+  bytes received` points at baud rate / parity.
+- **Commands do nothing** – check `mode: direct` and that the adapter is on
+  the free port, not on the controller cable.
+- **"PCWU did not accept …"** – the controller refused the value (outside the
+  range of your firmware); the entity shows the actual value.
+- Set `log_level: debug` to see every frame and get raw dumps of both register
+  blocks on `hewalex/debug/status` and `hewalex/debug/config`.
 
-1. Verify your RS485 adapter is reachable: `ping 192.168.1.100`
-2. Verify TCP port is open: `nc -zv 192.168.1.100 8899`
-3. Check baud rate matches: adapter and G-426 controller must both be **38400**
-4. Set `log_level` to `debug` to see raw protocol data
+## Upgrading from 1.0.x
 
-### Incorrect temperature values
+Version 1.0.x decoded the registers wrongly (wrong addresses and byte order)
+and its write command could not work. 2.0.0 removes the old entities that no
+longer exist (circulation pump flag, heat pump flag, manual mode, heater power
+limit, the old circulation pump settings). Entities that still exist keep
+their entity ID.
 
-The register offsets may vary slightly between firmware versions. Enable debug
-logging to see raw register dumps at `hewalex/debug/status` and
-`hewalex/debug/config` MQTT topics, then cross-reference with known values on
-your G-426 controller display.
+## Credits
 
-### Commands not working
-
-- Ensure you are in `direct` mode (not `eavesdrop`)
-- Verify controller/device IDs match your G-426 settings
-- Check that you're connected to the **dedicated** RS485 port (not eavesdropping)
-
-## Protocol Notes
-
-This add-on implements the GECO protocol used by Hewalex G-422/G-426 controllers.
-The protocol was reverse-engineered by the community; key references:
-
-- [hewalex-geco-protocol](https://github.com/aelias-eu/hewalex-geco-protocol)
-- [Domoticz-Hewalex](https://github.com/mvdklip/Domoticz-Hewalex)
-- [Hewalex2Mqtt](https://github.com/Chibald/Hewalex2Mqtt)
-- [Elektroda forum thread](https://www.elektroda.pl/rtvforum/topic3499254.html)
-
-The register map in this add-on is based on these sources. If your firmware uses
-different register offsets, you can modify `pcwu_registers.py` inside the
-container at `/app/pcwu_registers.py`.
-
-## License
-
-GPL-3.0 (consistent with upstream Hewalex2Mqtt and Domoticz-Hewalex projects)
+Protocol reverse engineering by krzysztof1111111111
+([elektroda.pl](https://www.elektroda.pl/rtvforum/topic3499254.html)),
+[aelias-eu/hewalex-geco-protocol](https://github.com/aelias-eu/hewalex-geco-protocol)
+and [mvdklip/Domoticz-Hewalex](https://github.com/mvdklip/Domoticz-Hewalex),
+whose register map this add-on follows.

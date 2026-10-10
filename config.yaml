@@ -1,6 +1,6 @@
 name: "Hewalex PCWU"
-description: "Hewalex PCWU heat pump integration via MQTT with Home Assistant auto-discovery"
-version: "1.0.1"
+description: "Hewalex PCWU heat pump via RS485, with Home Assistant MQTT discovery"
+version: "2.0.0"
 slug: "hewalex_pcwu"
 url: "https://github.com/Emacee/hewalex-mqtt-auto-discovery/"
 arch:
@@ -12,39 +12,40 @@ arch:
 init: false
 startup: application
 boot: auto
-map:
-  - config:rw
+uart: true
 services:
-  - mqtt:need
+  - mqtt:want
 options:
   device_address: "192.168.1.100"
   device_port: 8899
   mode: "direct"
   poll_interval: 30
+  expert_mode: false
+  controller_hard_id: 1
+  controller_soft_id: 1
+  device_hard_id: 2
+  device_soft_id: 2
   mqtt_host: ""
   mqtt_port: 1883
   mqtt_user: ""
   mqtt_password: ""
   mqtt_topic_prefix: "hewalex"
   mqtt_discovery_prefix: "homeassistant"
-  controller_hard_id: 1
-  controller_soft_id: 1
-  device_hard_id: 2
-  device_soft_id: 2
   log_level: "info"
 schema:
   device_address: str
   device_port: port
   mode: list(direct|eavesdrop)
   poll_interval: "int(5,300)"
-  mqtt_host: str
-  mqtt_port: port
-  mqtt_user: str
-  mqtt_password: password
-  mqtt_discovery_prefix: str
-  mqtt_topic_prefix: str
+  expert_mode: bool
   controller_hard_id: "int(1,255)"
-  controller_soft_id: "int(0,255)"
+  controller_soft_id: "int(0,65535)"
   device_hard_id: "int(1,255)"
-  device_soft_id: "int(0,255)"
+  device_soft_id: "int(0,65535)"
+  mqtt_host: str?
+  mqtt_port: port
+  mqtt_user: str?
+  mqtt_password: password?
+  mqtt_topic_prefix: str
+  mqtt_discovery_prefix: str
   log_level: list(debug|info|warning|error)
