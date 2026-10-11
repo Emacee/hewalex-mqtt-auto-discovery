@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.1.2
+
+- Eavesdrop: "Controller on" and "Operating state" now follow what the G-426
+  itself reports to the PCWU (its register 252: 0x10 on, 0x08 off) instead of
+  PCWU register 194, which reads 1 on a real PCWU while the controller is on.
+  Changes are logged ("G-426 controller reports status 0x10 (on)").
+- Eavesdrop with `log_level: debug`: every other frame on the line is logged
+  when its content changes, and the status block is published on
+  `<prefix>/debug/status`.
+
 ## 2.1.1
 
 - Cable test: when the G-426 controller answers, its settings are shown as raw

@@ -30,7 +30,7 @@ import serial
 import cable_test
 import pcwu
 from bus import GecoClient, GecoDeviceError, GecoTimeout, SharedBusError, Transport
-from geco import FNC_WRITE, FrameParser, GecoError
+from geco import FNC_READ_RESPONSE, FNC_WRITE, FrameParser, GecoError
 from ha_mqtt import HewalexMqtt
 
 VERSION = os.environ.get("ADDON_VERSION", "dev")
@@ -199,6 +199,7 @@ def run_eavesdrop(transport: Transport, bridge: Bridge, commands: queue.Queue,
     last_publish = 0.0
     last_warning = time.monotonic()
     seen = 0
+    last_payload: dict[tuple, bytes] = {}
     while not stop_event.is_set():
         try:
             if not transport.is_open:
@@ -209,18 +210,36 @@ def run_eavesdrop(transport: Transport, bridge: Bridge, commands: queue.Queue,
                 logger.warning("Ignoring command for %s: %s", key, why)
             chunk = transport.read(1.0)
             for frame in parser.feed(chunk):
-                # Status block written by the PCWU to the controller display.
-                if (frame.fnc == FNC_WRITE and not frame.is_error
-                        and pcwu.STATUS_START <= frame.start < pcwu.CONFIG_START
-                        and frame.start + frame.count <= pcwu.CONFIG_START):
+                is_status = (frame.fnc == FNC_WRITE and not frame.is_error
+                             and pcwu.STATUS_START <= frame.start < pcwu.CONFIG_START
+                             and frame.start + frame.count <= pcwu.CONFIG_START)
+                if LOG_LEVEL == "DEBUG" and not is_status:
+                    # Everything else on the line, logged only when it changes.
+                    key = (frame.src_hard, frame.dst_hard, frame.fnc, frame.marker, frame.start, frame.count)
+                    if last_payload.get(key) != frame.data:
+                        last_payload[key] = frame.data
+                        logger.debug("Bus: %s", frame.describe())
+                if is_status:
+                    # Status block written by the PCWU to the controller display.
                     bridge.image.update(frame.start, frame.data)
                     last_frame = time.monotonic()
                     seen += 1
                     if seen == 1:
                         logger.info("Receiving status frames from the PCWU")
+                elif (frame.fnc == FNC_READ_RESPONSE and not frame.is_error
+                      and frame.start == pcwu.CONTROLLER_STATUS and frame.data):
+                    # The controller answering the PCWU's poll of its register 252.
+                    if frame.data[0] != bridge.image.controller_flags:
+                        logger.info("G-426 controller reports status 0x%02X (%s)", frame.data[0],
+                                    "on" if frame.data[0] & pcwu.CONTROLLER_ON else "off")
+                    bridge.image.controller_flags = frame.data[0]
             now = time.monotonic()
             receiving = last_frame and now - last_frame < 60
             if receiving and now - last_publish >= POLL_INTERVAL:
+                if LOG_LEVEL == "DEBUG":
+                    status = bridge.image.raw(pcwu.STATUS_START, 104)
+                    if status:
+                        bridge.mqtt.publish_debug("status", pcwu.STATUS_START, status)
                 bridge.publish()
                 bridge.mqtt.set_available(True)
                 last_publish = now

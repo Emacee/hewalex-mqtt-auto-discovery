@@ -16,6 +16,9 @@ from __future__ import annotations
 import struct
 from dataclasses import dataclass, field
 
+CONTROLLER_STATUS = 252     # register of the G-426 the PCWU reads every cycle (controller cable)
+CONTROLLER_ON = 0x10        # ... its first byte: 0x10 display on, 0x08 display off,
+                            #     +0x01 parameter changed, +0x04 date/time changed
 STATUS_START = 120          # 120..301 status block (read only)
 CONFIG_START = 302          # 302..537 settings block (read/write)
 REG_END = 538               # first address that cannot be read
@@ -258,6 +261,19 @@ def points_for(expert: bool, writable_allowed: bool) -> list[Point]:
 class RegisterImage:
     def __init__(self) -> None:
         self._bytes: dict[int, int] = {}
+        # First byte of the G-426's register 252, only seen on the controller cable.
+        self.controller_flags: int | None = None
+
+    def controller_on(self) -> bool | None:
+        """
+        On the controller cable the G-426 tells the PCWU itself whether it is on
+        (register 252); otherwise fall back on PCWU register 194 (2 = on, as
+        observed by mvdklip on the PCWU's free port).
+        """
+        if self.controller_flags is not None:
+            return bool(self.controller_flags & CONTROLLER_ON)
+        value = self.u16(194)
+        return None if value is None else value == 2
 
     def update(self, start: int, data: bytes) -> None:
         for i, b in enumerate(data):
@@ -299,12 +315,12 @@ def format_schedule(mask: int) -> str:
 
 def operating_state(image: RegisterImage) -> str | None:
     """Combined state like the Domoticz plugin derives it (registers 194, 196, 202)."""
-    controller = image.u16(194)
+    controller_on = image.controller_on()
     flags = image.u16(196)
     ws = image.u16(202)
-    if controller is None or flags is None or ws is None:
+    if controller_on is None or flags is None or ws is None:
         return None
-    if controller != 2:
+    if not controller_on:
         return "Off (controller off)"
     for bit, text in ((WS_EXT_OFF, "Waiting: external stop"), (WS_DISABLED, "Waiting: disabled"),
                       (WS_RESTART_DELAY, "Waiting: restart delay"), (WS_LOW_COP, "Waiting: ambient too cold"),
@@ -328,8 +344,7 @@ def decode(point: Point, image: RegisterImage):
     if point.key == "OperatingState":
         return operating_state(image)
     if point.key == "ControllerOn":
-        value = image.u16(194)
-        return None if value is None else value == 2
+        return image.controller_on()
     if point.kind == "tprg":
         raw = image.raw(point.address, 4)
         return None if raw is None else format_schedule(struct.unpack("<I", raw)[0] & 0xFFFFFF)

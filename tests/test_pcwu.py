@@ -185,3 +185,19 @@ def test_expert_points_hidden_by_default():
     exposed = pcwu.points_for(expert=False, writable_allowed=True)
     assert not any(p.expert for p in exposed)
     assert pcwu.POINTS_BY_KEY["TapWaterTemp"] in exposed
+
+
+@pytest.mark.parametrize("flags,reg194,expected_on,expected_state", [
+    (None, 2, True, "Heating"),            # free port: register 194 (2 = on)
+    (None, 1, False, "Off (controller off)"),
+    (0x10, 1, True, "Heating"),            # controller cable: the G-426 itself says it is on
+    (0x11, 1, True, "Heating"),            # on, parameter changed
+    (0x08, 2, False, "Off (controller off)"),
+])
+def test_controller_state_prefers_controller_report(flags, reg194, expected_on, expected_state):
+    image = pcwu.RegisterImage()
+    for address, value in ((194, reg194), (196, 0x0805), (202, 0)):
+        image.update(address, struct.pack("<H", value))
+    image.controller_flags = flags
+    assert pcwu.decode(pcwu.POINTS_BY_KEY["ControllerOn"], image) is expected_on
+    assert pcwu.operating_state(image) == expected_state

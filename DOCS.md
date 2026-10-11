@@ -151,7 +151,7 @@ If the adapter is reachable but no frame is ever recognised, swap A and B.
 | T1 ambient … T10 after compressor | 128–146 | temperatures (T4 and T5 disabled by default) |
 | Fan, Water pump, Compressor, Electric heater E | 196 bits 0, 2, 11, 12 | running |
 | Operating state | 194, 196, 202 | Heating, Defrosting, Idle, Waiting: …, Error: … |
-| Controller on | 194 | the G-426 display/controller is switched on |
+| Controller on | G-426 register 252 (eavesdrop), 194 (direct) | the G-426 controller is switched on |
 | Expansion valve position | 198 | steps |
 | Waiting status code, Restart timer | 202, 206 | raw values, diagnostic |
 | Installation scheme | 302 | diagnostic, read only |

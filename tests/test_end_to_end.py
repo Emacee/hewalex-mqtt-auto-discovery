@@ -184,6 +184,7 @@ def test_direct_mode_device_unreachable(broker):
 
 def test_eavesdrop_mode(broker):
     sim = SimulatorServer(eavesdrop=True).start()
+    sim.pcwu.set_word(194, 1)   # as on the real PCWU in the field: 194 = 1 while the controller is on
     ha = HomeAssistant(broker)
     addon = start_addon(broker, sim.port, MODE="eavesdrop", EXPERT_MODE="true")
     try:
@@ -192,6 +193,11 @@ def test_eavesdrop_mode(broker):
         ha.wait("hewalex/T1", "8.5")
         ha.wait("hewalex/T7", "45.7")
         ha.wait("hewalex/OperatingState", "Heating")
+        ha.wait("hewalex/ControllerOn", "ON")
+        # the G-426 switched off: it reports 0x08 in register 252
+        sim.controller.mem[252 - 100] = 0x08
+        ha.wait("hewalex/ControllerOn", "OFF", timeout=20)
+        ha.wait("hewalex/OperatingState", "Off (controller off)")
         # no controls in read-only mode: their discovery is removed
         ha.wait("homeassistant/number/hewalex_pcwu_tapwatertemp/config", "")
         ha.wait("homeassistant/switch/hewalex_pcwu_heatpumpenabled/config", "")
@@ -204,6 +210,9 @@ def test_eavesdrop_mode(broker):
         sim.shutdown()
         sim.server_close()
     assert "Traceback" not in out, out
+    assert "G-426 controller reports status 0x10 (on)" in out
+    assert "G-426 controller reports status 0x08 (off)" in out
+    assert "Bus: read-response 2/2 -> 1/1 start=252 count=4 data=08000000" in out
 
 
 @pytest.mark.parametrize("pump_answers", [False, True])
