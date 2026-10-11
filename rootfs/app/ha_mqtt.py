@@ -79,6 +79,14 @@ class HewalexMqtt:
         self.client.connect_async(self._host, self._port, keepalive=60)
         self.client.loop_start()
 
+    def set_points(self, points: list[Point], hidden: list[Point]) -> None:
+        """Change the exposed entities while running (e.g. controls once the bus is known to be safe)."""
+        self.points = points
+        self.hidden = hidden
+        if self.connected:
+            self._publish_discovery()
+            self._republish_all()
+
     def stop(self) -> None:
         self.client.publish(self.availability_topic, "offline", qos=1, retain=True).wait_for_publish(2)
         self.client.disconnect()
@@ -133,6 +141,7 @@ class HewalexMqtt:
                 "name": "Hewalex PCWU",
                 "manufacturer": "Hewalex",
                 "model": "PCWU heat pump (G-426)",
+                "sw_version": self.version,
             },
             "origin": {
                 "name": "Hewalex PCWU add-on",

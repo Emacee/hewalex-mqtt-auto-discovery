@@ -1,7 +1,11 @@
 #!/usr/bin/with-contenv bashio
 # shellcheck shell=bash
 
-export ADDON_VERSION="$(bashio::addon.version)"
+if declare -F bashio::app.version > /dev/null; then
+    export ADDON_VERSION="$(bashio::app.version)"
+else
+    export ADDON_VERSION="$(bashio::addon.version)"
+fi
 export DEVICE_ADDRESS="$(bashio::config 'device_address')"
 export DEVICE_PORT="$(bashio::config 'device_port')"
 export MODE="$(bashio::config 'mode')"

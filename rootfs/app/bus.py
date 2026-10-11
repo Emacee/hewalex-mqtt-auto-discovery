@@ -5,6 +5,11 @@ The PCWU is a slave on its dedicated RS485 port: we send a 0x40 read or 0x60
 write and it answers with 0x50 / 0x70. Every response is matched on function,
 addresses, start register and byte count, so stale or foreign frames on the
 line can never be mistaken for the answer.
+
+On that port nobody talks unless asked. On the cable between the PCWU and its
+G-426 controller, the PCWU is master and queries the controller twice a second.
+Requests from another master are therefore the signature of the wrong cable;
+writes are refused as soon as one has been seen.
 """
 
 from __future__ import annotations
@@ -15,7 +20,7 @@ import time
 import serial
 
 from geco import (
-    FNC_READ_RESPONSE, FNC_WRITE_RESPONSE, Frame, FrameParser, GecoError,
+    FNC_READ, FNC_READ_RESPONSE, FNC_WRITE, FNC_WRITE_RESPONSE, Frame, FrameParser, GecoError,
     read_request, write_request,
 )
 
@@ -30,6 +35,14 @@ class GecoTimeout(GecoError):
 
 class GecoDeviceError(GecoError):
     """The device answered with an error frame."""
+
+
+class SharedBusError(GecoError):
+    """Another master is active on the line (adapter on the PCWU <-> controller cable)."""
+
+
+def is_master_request(frame: Frame) -> bool:
+    return frame.fnc in (FNC_READ, FNC_WRITE) and not frame.is_error
 
 
 class Transport:
@@ -95,6 +108,26 @@ class GecoClient:
         self.timeout = timeout
         self.retries = retries
         self.max_read = max_read
+        self.foreign_requests: list[Frame] = []   # requests sent by another master
+
+    def listen(self, seconds: float) -> list[Frame]:
+        """Collect frames for `seconds` without sending anything."""
+        parser = FrameParser()
+        frames: list[Frame] = []
+        deadline = time.monotonic() + seconds
+        while (remaining := deadline - time.monotonic()) > 0:
+            frames += parser.feed(self.transport.read(min(remaining, 0.25)))
+        return frames
+
+    def check_bus(self, seconds: float = 1.2) -> list[Frame]:
+        """
+        Listen silently and return requests sent by another master. Empty on the
+        PCWU's free port; on the controller cable the PCWU's own cycle (every
+        500 ms) shows up.
+        """
+        foreign = [f for f in self.listen(seconds) if is_master_request(f)]
+        self.foreign_requests += foreign
+        return foreign
 
     def _matches(self, frame: Frame, fnc: int, start: int, count: int) -> bool:
         return (frame.src_hard == self.dev_hard and frame.dst_hard == self.con_hard
@@ -118,6 +151,8 @@ class GecoClient:
                 if not chunk:
                     continue
                 for frame in parser.feed(chunk):
+                    if is_master_request(frame) and frame != request:
+                        self.foreign_requests.append(frame)
                     if not self._matches(frame, fnc, request.start, request.count):
                         logger.debug("Ignoring frame %s", frame.describe())
                         continue
@@ -143,7 +178,14 @@ class GecoClient:
         return bytes(result)
 
     def write_u16(self, address: int, value: int) -> None:
-        """Write one 16-bit register; returns when the device acknowledged it."""
+        """
+        Write one 16-bit register; returns when the device acknowledged it.
+        Refused (SharedBusError) when another master was ever seen on the line,
+        or shows up while listening just before the write.
+        """
+        if self.foreign_requests or self.check_bus(0.7):
+            raise SharedBusError(f"write to register {address} refused: another master is active on this "
+                                 f"RS485 line ({self.foreign_requests[-1].describe()})")
         data = bytes((value & 0xFF, (value >> 8) & 0xFF))
         request = write_request(self.dev_hard, self.con_hard, self.dev_soft, self.con_soft, address, data)
         self._transact(request, FNC_WRITE_RESPONSE)

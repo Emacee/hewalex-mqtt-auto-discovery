@@ -8,6 +8,11 @@ direct    – the add-on is master on the PCWU's free RS485 port: it polls the
 eavesdrop – the adapter listens on the cable between G-426 controller and
             PCWU. The PCWU writes its status block to the controller twice a
             second (0x60 at 120); those frames are decoded. Read only.
+
+Direct mode first listens silently. If the PCWU's own traffic to its controller
+shows up, the adapter is on the controller cable: controls are not offered,
+writes are refused, a read-only cable test is logged and the add-on continues
+like eavesdrop mode.
 """
 
 from __future__ import annotations
@@ -22,8 +27,9 @@ import time
 
 import serial
 
+import cable_test
 import pcwu
-from bus import GecoClient, GecoDeviceError, GecoTimeout, Transport
+from bus import GecoClient, GecoDeviceError, GecoTimeout, SharedBusError, Transport
 from geco import FNC_WRITE, FrameParser, GecoError
 from ha_mqtt import HewalexMqtt
 
@@ -68,6 +74,10 @@ class Bridge:
         self.points = points
         self.image = pcwu.RegisterImage()
         self.last_full_publish = 0.0
+
+    def set_points(self, points: list[pcwu.Point]) -> None:
+        self.points = points
+        self.mqtt.set_points(points, [p for p in pcwu.POINTS if p not in points])
 
     def publish(self, only_status: bool = False) -> None:
         force = time.monotonic() - self.last_full_publish > FULL_REPUBLISH_INTERVAL
@@ -123,7 +133,9 @@ def execute_command(client: GecoClient, bridge: Bridge, key: str, payload: str) 
     bridge.publish(only_status=True)
 
 
-def run_direct(transport: Transport, bridge: Bridge, commands: queue.Queue) -> None:
+def run_direct(transport: Transport, bridge: Bridge, commands: queue.Queue,
+               controls: list[pcwu.Point]) -> GecoClient | None:
+    """Poll and execute commands. Returns the client when another master is found on the line."""
     client = GecoClient(transport, CON_HARD_ID, CON_SOFT_ID, DEV_HARD_ID, DEV_SOFT_ID)
     failures = 0
     next_poll = 0.0
@@ -131,8 +143,15 @@ def run_direct(transport: Transport, bridge: Bridge, commands: queue.Queue) -> N
         try:
             if not transport.is_open:
                 transport.open()
+                if client.check_bus():
+                    return client
+                if bridge.points != controls:
+                    logger.info("RS485 line is quiet: adapter is on the PCWU's free port, enabling controls")
+                    bridge.set_points(controls)
             if time.monotonic() >= next_poll:
                 poll(client, bridge)
+                if client.foreign_requests:
+                    return client
                 failures = 0
                 bridge.mqtt.set_available(True)
                 next_poll = time.monotonic() + POLL_INTERVAL
@@ -141,6 +160,9 @@ def run_direct(transport: Transport, bridge: Bridge, commands: queue.Queue) -> N
             except queue.Empty:
                 continue
             execute_command(client, bridge, key, payload)
+        except SharedBusError as exc:
+            logger.error("%s", exc)
+            return client
         except GecoDeviceError as exc:
             logger.error("%s", exc)
         except (GecoTimeout, GecoError, serial.SerialException, OSError) as exc:
@@ -151,13 +173,27 @@ def run_direct(transport: Transport, bridge: Bridge, commands: queue.Queue) -> N
             transport.close()
             next_poll = time.monotonic() + min(5 * failures, 60)
             stop_event.wait(min(5 * failures, 60))
+    return None
+
+
+def on_controller_cable(client: GecoClient, bridge: Bridge, status_points: list[pcwu.Point]) -> None:
+    logger.error("Direct mode, but the PCWU is talking to its G-426 controller on this RS485 line: the adapter "
+                 "is on the controller cable, not on the PCWU's free port. Controls are disabled and nothing "
+                 "will be written; continuing read only.")
+    bridge.set_points(status_points)
+    for frame in client.foreign_requests:
+        if (frame.fnc == FNC_WRITE and pcwu.STATUS_START <= frame.start
+                and frame.start + frame.count <= pcwu.CONFIG_START):
+            bridge.image.update(frame.start, frame.data)
+    cable_test.run(client, bridge.image)
 
 
 # ──────────────────────────────────────────────────────────────────────
 # Eavesdrop mode
 # ──────────────────────────────────────────────────────────────────────
 
-def run_eavesdrop(transport: Transport, bridge: Bridge, commands: queue.Queue) -> None:
+def run_eavesdrop(transport: Transport, bridge: Bridge, commands: queue.Queue,
+                  why: str = "eavesdrop mode is read only") -> None:
     parser = FrameParser()
     last_frame = 0.0
     last_publish = 0.0
@@ -170,7 +206,7 @@ def run_eavesdrop(transport: Transport, bridge: Bridge, commands: queue.Queue) -
                 parser.clear()
             while not commands.empty():
                 key, _ = commands.get_nowait()
-                logger.warning("Ignoring command for %s: eavesdrop mode is read only", key)
+                logger.warning("Ignoring command for %s: %s", key, why)
             chunk = transport.read(1.0)
             for frame in parser.feed(chunk):
                 # Status block written by the PCWU to the controller display.
@@ -211,8 +247,13 @@ def main() -> None:
                 VERSION, MODE, DEVICE_ADDRESS, DEVICE_PORT, CON_HARD_ID, CON_SOFT_ID, DEV_HARD_ID, DEV_SOFT_ID,
                 POLL_INTERVAL, ", expert mode" if EXPERT_MODE else "")
 
-    exposed = pcwu.points_for(expert=EXPERT_MODE, writable_allowed=(MODE == "direct"))
-    hidden = [p for p in pcwu.POINTS if p not in exposed]
+    status_points = pcwu.points_for(expert=EXPERT_MODE, writable_allowed=False)
+    controls = pcwu.points_for(expert=EXPERT_MODE, writable_allowed=True)
+    # Direct mode starts with the status entities only; controls follow once the
+    # RS485 line turned out to be the PCWU's free port. Controls are not removed
+    # meanwhile, so their entity settings survive a restart.
+    exposed = status_points
+    hidden = [p for p in pcwu.POINTS if p not in (controls if MODE == "direct" else status_points)]
 
     commands: queue.Queue = queue.Queue()
     mqtt_client = HewalexMqtt(
@@ -228,7 +269,11 @@ def main() -> None:
     transport = Transport(DEVICE_ADDRESS, DEVICE_PORT)
     try:
         if MODE == "direct":
-            run_direct(transport, bridge, commands)
+            shared = run_direct(transport, bridge, commands, controls)
+            if shared is not None:
+                on_controller_cable(shared, bridge, status_points)
+                run_eavesdrop(transport, bridge, commands,
+                              why="the adapter is on the controller cable, settings cannot be written there")
         else:
             run_eavesdrop(transport, bridge, commands)
     finally:

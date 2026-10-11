@@ -1,5 +1,27 @@
 # Changelog
 
+## 2.1.0
+
+### Added
+
+- Direct mode first listens to the RS485 line. When the PCWU's own traffic to
+  its G-426 controller shows up, the adapter is on the controller cable
+  instead of the PCWU's free port: no controls are offered, every write is
+  refused and the add-on continues read only, like eavesdrop mode.
+- On that cable a one-time, read-only cable test is written to the log: who
+  answers on the configured address (the controller keeps a copy of the
+  PCWU status, recognisable by a message counter in register 196), which
+  settings that party holds, and whether the PCWU itself accepts requests on
+  this cable.
+- Writes are also refused when traffic from another master appears later, or
+  during a short listen just before each write.
+- `pcwu_simulator.py --eavesdrop` simulates a controller that answers requests.
+
+### Changed
+
+- Controls are published once the line is known to be the free port.
+- Device info shows the add-on version; no bashio deprecation warning.
+
 ## 2.0.0
 
 Rewrite of the protocol layer. 1.0.x did not talk the GECO protocol

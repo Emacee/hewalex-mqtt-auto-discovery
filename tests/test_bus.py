@@ -1,7 +1,7 @@
 import pytest
 
 import pcwu
-from bus import GecoClient, GecoDeviceError, GecoTimeout, Transport
+from bus import GecoClient, GecoDeviceError, GecoTimeout, SharedBusError, Transport
 from pcwu_simulator import SimulatorServer
 
 
@@ -61,3 +61,27 @@ def test_retry_after_lost_response_and_noise(sim, client):
     sim.drop_next = 1
     sim.noise = True
     assert client.read(128, 2) == b"\x55\x00"
+
+
+def test_free_port_is_quiet(client):
+    assert client.check_bus(0.7) == []
+
+
+def test_controller_cable_detected_and_writes_refused():
+    sim = SimulatorServer(eavesdrop=True).start()
+    transport = Transport("127.0.0.1", sim.port)
+    transport.open()
+    try:
+        client = GecoClient(transport, 1, 1, 2, 2, timeout=0.5, retries=0)
+        foreign = client.check_bus()
+        assert foreign and {f.fnc for f in foreign} == {0x40, 0x60}
+        with pytest.raises(SharedBusError):
+            client.write_u16(304, 0)
+        # a fresh client (nothing seen yet) is stopped by the listen before the write
+        with pytest.raises(SharedBusError):
+            GecoClient(transport, 1, 1, 2, 2).write_u16(304, 0)
+        assert sim.controller.writes == [] and sim.pcwu.writes == []
+    finally:
+        transport.close()
+        sim.shutdown()
+        sim.server_close()

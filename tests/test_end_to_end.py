@@ -204,3 +204,34 @@ def test_eavesdrop_mode(broker):
         sim.shutdown()
         sim.server_close()
     assert "Traceback" not in out, out
+
+
+@pytest.mark.parametrize("pump_answers", [False, True])
+def test_direct_mode_on_controller_cable(broker, pump_answers):
+    sim = SimulatorServer(eavesdrop=True, pump_answers_on_cable=pump_answers).start()
+    ha = HomeAssistant(broker)
+    addon = start_addon(broker, sim.port)
+    try:
+        ha.wait("hewalex/T1", "8.5")
+        ha.wait("hewalex/OperatingState", "Heating")
+        ha.wait("hewalex/availability", "online")
+        # controls are never offered on this cable, and existing ones are removed
+        ha.wait("homeassistant/switch/hewalex_pcwu_heatpumpenabled/config", "")
+        assert ha.messages.get("homeassistant/number/hewalex_pcwu_tapwatertemp/config", "") == ""
+        ha.command("HeatPumpEnabled", "OFF")
+        time.sleep(1.5)
+    finally:
+        out = stop_addon(addon)
+        ha.stop()
+        sim.shutdown()
+        sim.server_close()
+    assert "Traceback" not in out, out
+    assert sim.controller.writes == [] and sim.pcwu.writes == []
+    assert "the adapter is on the controller cable" in out
+    assert "Test 1, status read from 2/2: the G-426 controller answered" in out
+    assert "Test 2, settings read from 2/2: Heat pump enabled = on; Hot water target = 50.0 °C" in out
+    if pump_answers:
+        assert "Test 3, status read from the PCWU (1/1) as 3/3: the PCWU answered" in out
+    else:
+        assert "Test 3, status read from the PCWU (1/1) as 3/3: no answer" in out
+    assert "Ignoring command for HeatPumpEnabled" in out

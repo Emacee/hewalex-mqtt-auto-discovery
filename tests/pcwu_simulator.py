@@ -2,8 +2,16 @@
 """
 Simulated Hewalex PCWU behind an RS485-to-TCP adapter, for testing without hardware.
 
-  python3 tests/pcwu_simulator.py --port 8899               # dedicated port (direct mode)
-  python3 tests/pcwu_simulator.py --port 8899 --eavesdrop   # traffic between PCWU and G-426
+  python3 tests/pcwu_simulator.py --port 8899               # the PCWU's free RS485 port
+  python3 tests/pcwu_simulator.py --port 8899 --eavesdrop   # the cable between PCWU and G-426
+
+On the free port the PCWU (default address 2/2) only answers requests. On the
+controller cable the PCWU (1/1) is master: twice a second it reads registers
+100 and 252 from the G-426 controller (2/2) and writes its status block to it.
+The controller answers any request addressed to it from its own memory, which
+holds the copy of the status block (with a message counter in bits 13..15 of
+register 196) and a copy of the settings. `pump_answers_on_cable` makes the
+PCWU also answer requests addressed to 1/1 on that cable.
 
 The framing here is written independently from rootfs/app/geco.py (CRCs come
 from the reference library) so the end-to-end test does not just test the
@@ -88,6 +96,9 @@ class Pcwu:
         }
         for address, value in words.items():
             self.set_word(address, value)
+        for i, b in enumerate(bytes.fromhex("1890016f01008002") + bytes(12)):
+            self.mem[i] = b                      # registers 100..119 as the controller reports them
+        self.mem[252 - MEM_START] = 0x10         # controller status: display on, nothing changed
         for address, mask in ((314, 0x3FFFC0), (318, 0xFFFFFF), (322, 0xFFFFFF), (374, 0)):
             self.mem[address - MEM_START:address - MEM_START + 4] = struct.pack("<I", mask)
         for i, b in enumerate((26, 10, 10, 5, 12, 30, 0, 0)):  # date 2026-10-10, time 12:30:00
@@ -123,61 +134,85 @@ class Handler(socketserver.BaseRequestHandler):
     def handle(self):
         server = self.server
         sock = self.request
+        lock = threading.Lock()
+        stop = threading.Event()
         if server.eavesdrop:
-            self.stream_bus(sock)
-            return
+            threading.Thread(target=self.stream_bus, args=(sock, lock, stop), daemon=True).start()
         buf = bytearray()
-        while True:
-            try:
-                chunk = sock.recv(512)
-            except OSError:
-                return
-            if not chunk:
-                return
-            buf += chunk
-            for to_hard, _, to_soft, from_soft, fnc, count, start, data in parse_frames(buf):
-                if to_hard != server.dev_hard or to_soft != server.dev_soft:
-                    continue
-                if server.drop_next:
-                    server.drop_next -= 1
-                    continue
-                time.sleep(0.01)
-                if server.noise:
-                    sock.sendall(b"\x69\x00\xff\x69")
-                if fnc == 0x40:
-                    data = server.pcwu.read(start, count)
-                    reply = (frame(server.con_hard, server.dev_hard, from_soft, to_soft, 0x50, start, count, data)
-                             if data is not None else
-                             frame(server.con_hard, server.dev_hard, from_soft, to_soft, 0x50, error=0x04))
-                elif fnc == 0x60:
-                    ok = server.pcwu.write(start, data)
-                    reply = (frame(server.con_hard, server.dev_hard, from_soft, to_soft, 0x70, start, count)
-                             if ok else
-                             frame(server.con_hard, server.dev_hard, from_soft, to_soft, 0x70, error=0x04))
-                else:
-                    continue
-                sock.sendall(reply)
+        try:
+            while True:
+                try:
+                    chunk = sock.recv(512)
+                except OSError:
+                    return
+                if not chunk:
+                    return
+                buf += chunk
+                for to_hard, from_hard, to_soft, from_soft, fnc, count, start, data in parse_frames(buf):
+                    target = self.target(to_hard, to_soft)
+                    if target is None:
+                        continue
+                    if server.drop_next:
+                        server.drop_next -= 1
+                        continue
+                    time.sleep(0.01)
+                    if server.noise:
+                        sock.sendall(b"\x69\x00\xff\x69")
+                    if fnc == 0x40:
+                        data = target.read(start, count)
+                        reply = (frame(from_hard, to_hard, from_soft, to_soft, 0x50, start, count, data)
+                                 if data is not None else
+                                 frame(from_hard, to_hard, from_soft, to_soft, 0x50, error=0x04))
+                    elif fnc == 0x60:
+                        ok = target.write(start, data)
+                        reply = (frame(from_hard, to_hard, from_soft, to_soft, 0x70, start, count)
+                                 if ok else
+                                 frame(from_hard, to_hard, from_soft, to_soft, 0x70, error=0x04))
+                    else:
+                        continue
+                    with lock:
+                        sock.sendall(reply)
+        finally:
+            stop.set()
 
-    def stream_bus(self, sock):
-        """Traffic between PCWU (hard 1) and G-426 display (hard 2), twice a second."""
+    def target(self, hard, soft):
+        server = self.server
+        if not server.eavesdrop:
+            return server.pcwu if (hard, soft) == (server.dev_hard, server.dev_soft) else None
+        if (hard, soft) == (2, 2):
+            return server.controller
+        if (hard, soft) == (1, 1) and server.pump_answers_on_cable:
+            return server.pcwu
+        return None
+
+    def stream_bus(self, sock, lock, stop):
+        """Traffic between PCWU (hard 1) and G-426 controller (hard 2), twice a second."""
         pcwu = self.server.pcwu
-        while True:
-            status = pcwu.read(120, 104)
+        controller = self.server.controller
+        counter = 0
+        while not stop.is_set():
+            counter = (counter + 1) % 8
+            status = bytearray(pcwu.read(120, 104))
+            flags = struct.unpack_from("<H", status, 76)[0] & 0x1FFF | counter << 13
+            struct.pack_into("<H", status, 76, flags)
+            controller.mem[120 - MEM_START:224 - MEM_START] = status
             cycle = (
                 frame(2, 1, 2, 1, 0x40, 100, 20),
-                frame(1, 2, 1, 2, 0x50, 100, 20, bytes.fromhex("1890016f01008002") + bytes(12)),
-                frame(2, 1, 2, 1, 0x60, 120, 104, status),
+                frame(1, 2, 1, 2, 0x50, 100, 20, controller.read(100, 20)),
+                frame(2, 1, 2, 1, 0x60, 120, 104, bytes(status)),
                 frame(1, 2, 1, 2, 0x70, 120, 104),
                 frame(2, 1, 2, 1, 0x40, 252, 4),
-                frame(1, 2, 1, 2, 0x50, 252, 4, b"\x10\x00\x00\x00"),
+                frame(1, 2, 1, 2, 0x50, 252, 4, controller.read(252, 4)),
             )
             try:
                 for f in cycle:
-                    sock.sendall(f[:5])
-                    time.sleep(0.005)
-                    sock.sendall(f[5:])
+                    with lock:
+                        sock.sendall(f[:5])
+                        time.sleep(0.005)
+                        sock.sendall(f[5:])
                     time.sleep(0.01)
-                sock.sendall(b"\x00\x69\xff")  # line noise
+                with lock:
+                    sock.sendall(b"\x00\x69\xff")  # line noise
             except OSError:
                 return
             time.sleep(0.36)
@@ -187,11 +222,13 @@ class SimulatorServer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
 
-    def __init__(self, port=0, eavesdrop=False, dev_hard=2, dev_soft=2, con_hard=1):
+    def __init__(self, port=0, eavesdrop=False, dev_hard=2, dev_soft=2, pump_answers_on_cable=False):
         super().__init__(("127.0.0.1", port), Handler)
         self.pcwu = Pcwu()
+        self.controller = Pcwu()                 # G-426: copy of status and settings
         self.eavesdrop = eavesdrop
-        self.dev_hard, self.dev_soft, self.con_hard = dev_hard, dev_soft, con_hard
+        self.pump_answers_on_cable = pump_answers_on_cable
+        self.dev_hard, self.dev_soft = dev_hard, dev_soft
         self.drop_next = 0
         self.noise = False
 
@@ -207,10 +244,12 @@ class SimulatorServer(socketserver.ThreadingTCPServer):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--port", type=int, default=8899)
-    ap.add_argument("--eavesdrop", action="store_true")
+    ap.add_argument("--eavesdrop", action="store_true", help="simulate the controller cable instead of the free port")
+    ap.add_argument("--pump-answers-on-cable", action="store_true")
     args = ap.parse_args()
-    server = SimulatorServer(args.port, args.eavesdrop)
-    print(f"Simulated PCWU listening on 127.0.0.1:{server.port} ({'eavesdrop' if args.eavesdrop else 'direct'})")
+    server = SimulatorServer(args.port, args.eavesdrop, pump_answers_on_cable=args.pump_answers_on_cable)
+    print(f"Simulated PCWU listening on 127.0.0.1:{server.port} "
+          f"({'controller cable' if args.eavesdrop else 'free port'})")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

@@ -34,6 +34,13 @@ them; the other one is free.
 The add-on is master on this port; the controller keeps working as usual on
 the other one.
 
+Direct mode checks this at every (re)connect: it first listens for a moment.
+The free port is silent, but on the controller cable the PCWU queries its
+controller twice a second. If that traffic shows up, the add-on refuses to
+write anything, offers no controls, logs a read-only *cable test* (who
+answers, which settings the controller holds, whether the PCWU itself answers
+on that cable) and carries on read only.
+
 ### Eavesdrop mode (read only)
 
 Connect the adapter in parallel to A and B of the cable between G-426 and the
