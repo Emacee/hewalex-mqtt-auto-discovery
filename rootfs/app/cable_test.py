@@ -11,8 +11,9 @@ waits for the quiet gap after a cycle and then asks:
    writes to the controller, so a non-zero counter means the controller answered.
 2. the configured device address for the settings block, so the values can be
    compared with the controller menu.
-3. the PCWU itself, on the address it uses on this cable, from an unused
-   address. An answer would mean the PCWU also accepts requests on this port.
+3. the PCWU itself, on the address it uses on this cable and on the factory
+   address of its free port (255/65535), from an unused address. An answer
+   would mean the PCWU also accepts requests on this cable.
 
 Nothing is ever written.
 """
@@ -99,20 +100,32 @@ def run(client: GecoClient, broadcast: pcwu.RegisterImage) -> list[str]:
             break
         first = first or result
         counters.append(struct.unpack_from("<H", result, 196 - pcwu.STATUS_START)[0] >> 13)
+    controller_answered = any(counters)
     if counters:
         image = _image(pcwu.STATUS_START, first)
-        same = all(pcwu.decode(pcwu.POINTS_BY_KEY[k], image) == pcwu.decode(pcwu.POINTS_BY_KEY[k], broadcast)
-                   for k in STATUS_COMPARED)
-        who = ("the G-426 controller answered (register 196 carries its message counter: "
-               f"{', '.join(map(str, counters))})" if any(counters) else
+        pairs = [(pcwu.decode(pcwu.POINTS_BY_KEY[k], image), pcwu.decode(pcwu.POINTS_BY_KEY[k], broadcast))
+                 for k in STATUS_COMPARED]
+        if any(b is None for _, b in pairs):
+            compared = "not compared (no status frame of the PCWU stored yet)"
+        elif all(a is not None and abs(a - b) <= 0.5 for a, b in pairs):
+            compared = "match the PCWU's own status frames"
+        else:
+            compared = "differ from the PCWU's own status frames"
+        who = (f"the G-426 controller answered (register 196 carries its message counter: "
+               f"{', '.join(map(str, counters))})" if controller_answered else
                "the answer has no controller message counter: probably the PCWU itself answered")
-        report.append(f"  Test 1, status read from {dev[0]}/{dev[1]}: {who}; temperatures "
-                      f"{'equal' if same else 'differ from'} the PCWU's own status frames.")
+        report.append(f"  Test 1, status read from {dev[0]}/{dev[1]}: {who}; temperatures {compared}.")
 
     # 2. settings as held by whoever answers on the configured address
     result = probe(client, pcwu.CONFIG_START, pcwu.MAX_READ_BYTES)
     if isinstance(result, str):
         report.append(f"  Test 2, settings read from {dev[0]}/{dev[1]}: {result}.")
+    elif controller_answered:
+        words = struct.unpack_from("<16H", result)
+        report.append(f"  Test 2, settings read from {dev[0]}/{dev[1]}: answered, but the controller keeps its "
+                      "settings in its own register layout, not the PCWU's, so they cannot be decoded as PCWU "
+                      "settings. First words: "
+                      + ", ".join(f"{pcwu.CONFIG_START + 2 * i}={w}" for i, w in enumerate(words)) + ".")
     else:
         image = _image(pcwu.CONFIG_START, result)
         report.append(f"  Test 2, settings read from {dev[0]}/{dev[1]}: "
@@ -124,20 +137,23 @@ def run(client: GecoClient, broadcast: pcwu.RegisterImage) -> list[str]:
     if pump:
         used = {pump[0], controller[0], client.con_hard, client.dev_hard}
         own = next(i for i in range(3, 255) if i not in used)
-        direct = GecoClient(client.transport, own, own, pump[0], pump[1], timeout=0.3, retries=0)
-        result = probe(direct, pcwu.STATUS_START, 104)
-        if isinstance(result, str):
-            report.append(f"  Test 3, status read from the PCWU ({pump[0]}/{pump[1]}) as {own}/{own}: {result} "
-                          "- the PCWU does not accept requests on this port.")
-        else:
-            pcwu_answers = True
-            report.append(f"  Test 3, status read from the PCWU ({pump[0]}/{pump[1]}) as {own}/{own}: the PCWU "
-                          "answered - it does accept requests on this cable.")
+        for label, (hard, soft) in (("the PCWU", pump), ("the free port's factory address", (255, 65535))):
+            direct = GecoClient(client.transport, own, own, hard, soft, timeout=0.3, retries=0)
+            result = probe(direct, pcwu.STATUS_START, 104)
+            if isinstance(result, str):
+                report.append(f"  Test 3, status read from {label} ({hard}/{soft}) as {own}/{own}: {result}.")
+            else:
+                pcwu_answers = True
+                report.append(f"  Test 3, status read from {label} ({hard}/{soft}) as {own}/{own}: answered - "
+                              "the PCWU does accept requests on this cable.")
+        if not pcwu_answers:
+            report.append("  Conclusion: on this cable only the controller answers; the PCWU does not accept "
+                          "requests here, so its free RS485 port is not bridged onto this cable.")
 
     report.append("  Writing stays blocked on this cable: the PCWU is master here and polls its controller "
                   "twice a second, so a second master collides with it"
                   + (", and requests to the configured address are answered by the controller, not by the PCWU. "
-                     if any(counters) and not pcwu_answers else ". ")
+                     if controller_answered and not pcwu_answers else ". ")
                   + "Connect the adapter to the free RS485 port of the PCWU to change settings. "
                   "Continuing read only.")
     for line in report:

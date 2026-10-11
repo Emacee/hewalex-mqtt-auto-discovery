@@ -229,9 +229,13 @@ def test_direct_mode_on_controller_cable(broker, pump_answers):
     assert sim.controller.writes == [] and sim.pcwu.writes == []
     assert "the adapter is on the controller cable" in out
     assert "Test 1, status read from 2/2: the G-426 controller answered" in out
-    assert "Test 2, settings read from 2/2: Heat pump enabled = on; Hot water target = 50.0 °C" in out
+    assert "temperatures match the PCWU's own status frames" in out
+    assert "Test 2, settings read from 2/2: answered, but the controller keeps its settings" in out
     if pump_answers:
-        assert "Test 3, status read from the PCWU (1/1) as 3/3: the PCWU answered" in out
+        assert "Test 3, status read from the PCWU (1/1) as 3/3: answered" in out
+        assert "Conclusion" not in out
     else:
         assert "Test 3, status read from the PCWU (1/1) as 3/3: no answer" in out
+        assert "Test 3, status read from the free port's factory address (255/65535) as 3/3: no answer" in out
+        assert "Conclusion: on this cable only the controller answers" in out
     assert "Ignoring command for HeatPumpEnabled" in out

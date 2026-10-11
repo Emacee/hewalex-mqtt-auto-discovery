@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.1.1
+
+- Cable test: when the G-426 controller answers, its settings are shown as raw
+  words (the controller uses its own register layout, decoding them with the
+  PCWU map gave meaningless values); temperatures are compared with a 0.5 °C
+  tolerance; the free port's factory address (255/65535) is also probed, with
+  a one-line conclusion.
+
 ## 2.1.0
 
 ### Added
